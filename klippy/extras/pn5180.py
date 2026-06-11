@@ -583,6 +583,7 @@ class PN5180Manager:
         self.start_page = config.getint("start_page", 4, minval=0)
         self.end_page = config.getint("end_page", 67, minval=0)
         self.debug_log = config.getboolean("debug_log", True)
+        self.happyhare_enable = config.getboolean("happyhare_enable", True)
         self.last_uid = None
         self.waiting_for_removal = False
         self.waiting_notice_sent = False
@@ -655,6 +656,7 @@ class PN5180Manager:
     def get_status(self):
         return {
             "debug_log": self.debug_log,
+            "happyhare_enable": self.happyhare_enable,
             "scan_count": self.scan_count,
             "last_scan_time": self.last_scan_time,
             "last_scan_result": self.last_scan_result,
@@ -782,6 +784,14 @@ class PN5180Manager:
         return None
 
     def _apply_spool_id(self, spool_id):
+        if not self.happyhare_enable:
+            self.gcode.respond_info(
+                "HappyHare spool ID found: %s. Dispatch disabled." % (
+                    spool_id,))
+            logging.info(
+                "PN5180 spool ID found but HappyHare dispatch disabled: %s",
+                spool_id)
+            return True
         command = "MMU_GATE_MAP NEXT_SPOOLID=%s" % (spool_id,)
         try:
             self.gcode.run_script(command)
@@ -889,9 +899,13 @@ class PN5180Manager:
             spool_id = self._extract_spool_id(data_str)
             if spool_id:
                 if self._apply_spool_id(spool_id):
+                    result = ("spool_applied" if self.happyhare_enable
+                              else "spool_detected")
+                    message = ("Spool ID applied" if self.happyhare_enable
+                               else "Spool ID detected; dispatch disabled")
                     self._set_scan_status(
-                        "spool_applied",
-                        "Spool ID applied",
+                        result,
+                        message,
                         uid=uid_list,
                         spool_id=spool_id,
                         data_preview=data_preview)
@@ -1007,6 +1021,7 @@ class PN5180:
             status.update({
                 "initialized": False,
                 "debug_log": False,
+                "happyhare_enable": False,
                 "scan_count": 0,
                 "last_scan_result": "not_initialized",
                 "last_scan_message": "PN5180 manager is not initialized",
@@ -1052,6 +1067,8 @@ class PN5180:
             bool(self.service and self.service.running),))
         self.gcode.respond_info("PN5180 debug log: %s" % (
             status["debug_log"],))
+        self.gcode.respond_info("PN5180 HappyHare dispatch: %s" % (
+            status["happyhare_enable"],))
         self.gcode.respond_info("PN5180 scan count: %d" % (
             status["scan_count"],))
         self.gcode.respond_info("PN5180 last result: %s - %s" % (
@@ -1135,8 +1152,13 @@ class PN5180:
         diag_flag = gcmd.get_int("DIAG", 0)
         recover_flag = gcmd.get_int("RECOVER", 0)
         debug_flag = gcmd.get_int("DEBUG", None)
+        happyhare_flag = gcmd.get_int("HAPPYHARE", None)
 
-        if debug_flag is not None:
+        if happyhare_flag is not None:
+            self.manager.happyhare_enable = bool(happyhare_flag)
+            self.gcode.respond_info("PN5180 HappyHare dispatch: %s" % (
+                self.manager.happyhare_enable,))
+        elif debug_flag is not None:
             self.manager.debug_log = bool(debug_flag)
             self.gcode.respond_info("PN5180 debug log: %s" % (
                 self.manager.debug_log,))
@@ -1177,6 +1199,12 @@ class PN5180:
                     self.name,))
             self.gcode.respond_info(
                 "  PN5180 NAME=%s DEBUG=0  - disable per-scan debug output" % (
+                    self.name,))
+            self.gcode.respond_info(
+                "  PN5180 NAME=%s HAPPYHARE=1 - enable MMU_GATE_MAP dispatch" % (
+                    self.name,))
+            self.gcode.respond_info(
+                "  PN5180 NAME=%s HAPPYHARE=0 - disable MMU_GATE_MAP dispatch" % (
                     self.name,))
 
 
