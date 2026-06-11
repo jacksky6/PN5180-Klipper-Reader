@@ -57,8 +57,10 @@ MIFARE_CMD_READ = 0x30
 
 ISO15693_CMD_INVENTORY = 0x01
 ISO15693_CMD_READ_SINGLE_BLOCK = 0x20
+ISO15693_CMD_READ_MULTIPLE_BLOCKS = 0x23
 ISO15693_FLAG_HIGH_DATA_RATE = 0x02
 ISO15693_FLAG_INVENTORY = 0x04
+ISO15693_FLAG_ADDRESS = 0x20
 ISO15693_FLAG_ONE_SLOT = 0x20
 
 DEFAULT_NTAG_START_PAGE = 4
@@ -103,7 +105,9 @@ class PN5180Handler:
         self.eeprom_version = None
         self.diag_registers = {}
         self.current_uid = None
+        self.current_uid_lsb_first = None
         self.current_uid_hex = ""
+        self.last_read_stats = {}
 
     def _mcu_print_time(self, eventtime=None):
         if eventtime is None:
@@ -369,7 +373,8 @@ class PN5180Handler:
         self.write_register_and_mask(CRC_TX_CONFIG, 0xFFFFFFFE)
 
         self.send_data([0x52 if wakeup else 0x26], valid_bits=0x07)
-        if not self._wait_irq(RX_IRQ_STAT, timeout=self.rf_timeout,
+        timeout = max(self.rf_timeout, self.rf_timeout * block_count)
+        if not self._wait_irq(RX_IRQ_STAT, timeout=timeout,
                               raise_on_error=False):
             logging.debug("PN5180 no ATQA response")
             return None
@@ -460,6 +465,7 @@ class PN5180Handler:
             return None
 
         self.current_uid = list(uid)
+        self.current_uid_lsb_first = None
         self.current_uid_hex = " ".join("%02X" % (b,) for b in self.current_uid)
         return {
             "uid": self.current_uid,
@@ -481,6 +487,7 @@ class PN5180Handler:
             tag = self.activate_type_a(wakeup=True)
             if not tag:
                 self.current_uid = None
+                self.current_uid_lsb_first = None
                 self.current_uid_hex = ""
                 return False, None
             return True, tag["uid"]
@@ -488,6 +495,7 @@ class PN5180Handler:
             logging.debug("PN5180 tag detection failed: %s", e)
             self.software_recover()
             self.current_uid = None
+            self.current_uid_lsb_first = None
             self.current_uid_hex = ""
             return False, None
 
@@ -511,6 +519,7 @@ class PN5180Handler:
         uid_lsb_first = data[2:10]
         uid = list(reversed(uid_lsb_first))
         self.current_uid = uid
+        self.current_uid_lsb_first = list(uid_lsb_first)
         self.current_uid_hex = " ".join("%02X" % (b,) for b in uid)
         return {
             "uid": uid,
@@ -525,6 +534,7 @@ class PN5180Handler:
             tag = self.iso15693_inventory()
             if not tag:
                 self.current_uid = None
+                self.current_uid_lsb_first = None
                 self.current_uid_hex = ""
                 return False, None
             return True, tag["uid"]
@@ -532,6 +542,7 @@ class PN5180Handler:
             logging.debug("PN5180 ISO15693 detection failed: %s", e)
             self.software_recover()
             self.current_uid = None
+            self.current_uid_lsb_first = None
             self.current_uid_hex = ""
             return False, None
 
@@ -557,24 +568,95 @@ class PN5180Handler:
                 "ISO15693 block %d error response 0x%02X" % (block, code))
         return data[1:]
 
+    def iso15693_read_multiple_blocks(self, start_block, block_count):
+        if block_count < 1:
+            return bytearray()
+        if block_count > 16:
+            raise PN5180Error("ISO15693 batch too large: %d" % (block_count,))
+        if not self.current_uid_lsb_first or len(self.current_uid_lsb_first) != 8:
+            raise PN5180Error("ISO15693 addressed read requires a detected UID")
+        self.send_data(
+            [ISO15693_FLAG_HIGH_DATA_RATE | ISO15693_FLAG_ADDRESS,
+             ISO15693_CMD_READ_MULTIPLE_BLOCKS]
+            + list(self.current_uid_lsb_first)
+            + [start_block & 0xFF, (block_count - 1) & 0xFF],
+            valid_bits=0x00)
+        if not self._wait_irq(RX_IRQ_STAT, timeout=self.rf_timeout,
+                              raise_on_error=False):
+            raise PN5180Error(
+                "timeout waiting ISO15693 blocks %d-%d" % (
+                    start_block, start_block + block_count - 1))
+        rx_len = self.rx_bytes_received()
+        expected_len = 1 + block_count * 4
+        if rx_len in (0, RX_BYTES_RECEIVED_MASK):
+            raise PN5180Error(
+                "invalid ISO15693 RX_STATUS length %d" % (rx_len,))
+        data = self.read_data(rx_len)
+        if not data:
+            raise PN5180Error("short ISO15693 multiple-block response")
+        if data[0] & 0x01:
+            code = data[1] if len(data) > 1 else 0
+            raise PN5180Error(
+                "ISO15693 blocks %d-%d error response 0x%02X" % (
+                    start_block, start_block + block_count - 1, code))
+        if len(data) != expected_len:
+            raise PN5180Error(
+                "unexpected ISO15693 blocks %d-%d length %d, expected %d" % (
+                    start_block, start_block + block_count - 1,
+                    len(data), expected_len))
+        return bytearray(data[1:])
+
     def iso15693_read_user_memory(self, start_block=DEFAULT_ISO15693_START_BLOCK,
-                                  end_block=DEFAULT_ISO15693_END_BLOCK):
+                                  end_block=DEFAULT_ISO15693_END_BLOCK,
+                                  batch_size=1):
+        read_start = time.time()
         user_data = bytearray()
-        for block in range(start_block, end_block + 1):
-            block_data = self.iso15693_read_single_block(block)
+        reads = 0
+        blocks_read = 0
+        stop_reason = "end_block"
+        last_block = start_block - 1
+        batch_size = max(1, min(int(batch_size), 16))
+        block = start_block
+        while block <= end_block:
+            count = min(batch_size, end_block - block + 1)
+            if count == 1:
+                block_data = bytearray(self.iso15693_read_single_block(block))
+            else:
+                block_data = self.iso15693_read_multiple_blocks(block, count)
+            reads += 1
+            blocks_read += count
+            last_block = block + count - 1
             if not block_data:
+                stop_reason = "empty_response"
                 break
             user_data.extend(block_data)
             expected_len = self._expected_tlv_total_length(user_data)
             if expected_len and len(user_data) >= expected_len:
                 user_data = user_data[:expected_len]
+                stop_reason = "tlv_complete"
                 break
             if expected_len is None and self._is_empty_data(block_data):
+                stop_reason = "empty_block"
                 break
+            block += count
         try:
             self.rf_off()
         except Exception:
             pass
+        elapsed = time.time() - read_start
+        self.last_read_stats = {
+            "protocol": "iso15693",
+            "read_mode": "multiple" if batch_size > 1 else "single",
+            "batch_size": batch_size,
+            "reads": reads,
+            "blocks": blocks_read,
+            "bytes": len(user_data),
+            "first_block": start_block,
+            "last_block": last_block,
+            "elapsed_ms": int(elapsed * 1000.0),
+            "avg_read_ms": int((elapsed * 1000.0 / reads) if reads else 0),
+            "stop_reason": stop_reason,
+        }
         return user_data
 
     def ntag_read_page(self, page):
@@ -614,10 +696,16 @@ class PN5180Handler:
 
     def ntag_read_user_memory(self, start_page=DEFAULT_NTAG_START_PAGE,
                               end_page=DEFAULT_NTAG_END_PAGE):
+        read_start = time.time()
         user_data = bytearray()
         page = start_page
+        reads = 0
+        stop_reason = "end_page"
+        last_page = start_page - 1
         while page <= end_page:
             block = self.ntag_read_page(page)
+            reads += 1
+            last_page = page
             remaining_pages = end_page - page + 1
             copy_len = min(remaining_pages, 4) * 4
             copied = block[:copy_len]
@@ -625,11 +713,25 @@ class PN5180Handler:
             expected_len = self._expected_tlv_total_length(user_data)
             if expected_len and len(user_data) >= expected_len:
                 user_data = user_data[:expected_len]
+                stop_reason = "tlv_complete"
                 break
             if expected_len is None and self._is_empty_data(copied):
+                stop_reason = "empty_page"
                 break
             page += 4
         self.mifare_halt()
+        elapsed = time.time() - read_start
+        self.last_read_stats = {
+            "protocol": "ntag",
+            "reads": reads,
+            "pages": reads * 4,
+            "bytes": len(user_data),
+            "first_page": start_page,
+            "last_page": last_page,
+            "elapsed_ms": int(elapsed * 1000.0),
+            "avg_read_ms": int((elapsed * 1000.0 / reads) if reads else 0),
+            "stop_reason": stop_reason,
+        }
         return user_data
 
     @staticmethod
@@ -827,6 +929,26 @@ class PN5180Manager:
             parts.append("waiting_removal=1")
         if self.last_error:
             parts.append("error=%s" % (self.last_error,))
+        line = " ".join(parts)
+        self.gcode.respond_info(line)
+        logging.info(line)
+
+    def _debug_profile_line(self, timings=None):
+        if not self.debug_log:
+            return
+        stats = dict(self.handler.last_read_stats or {})
+        parts = ["PN5180 profile:"]
+        if timings:
+            for key in ("detect_ms", "read_ms", "decode_ms", "total_ms"):
+                if key in timings:
+                    parts.append("%s=%d" % (key, timings[key]))
+        for key in (
+                "protocol", "read_mode", "batch_size", "reads", "blocks",
+                "pages", "bytes",
+                "first_block", "last_block", "first_page", "last_page",
+                "elapsed_ms", "avg_read_ms", "stop_reason"):
+            if key in stats:
+                parts.append("%s=%s" % (key, stats[key]))
         line = " ".join(parts)
         self.gcode.respond_info(line)
         logging.info(line)
@@ -1080,7 +1202,8 @@ class PN5180Manager:
                 error=str(e))
             return False
 
-    def rfid_read(self, report_no_tag=False):
+    def rfid_read(self, report_no_tag=False, iso15693_batch=1):
+        scan_start = time.time()
         self.scan_count += 1
         self._set_scan_status(
             "scanning", self._scan_message(), protocol="", add_event=False)
@@ -1132,7 +1255,9 @@ class PN5180Manager:
                     self._debug_scan_line()
                     return None
 
+            detect_start = time.time()
             tag = self._detect_tag()
+            detect_ms = int((time.time() - detect_start) * 1000.0)
             if not tag:
                 self.consecutive_no_tag += 1
                 self._set_scan_status(
@@ -1162,10 +1287,13 @@ class PN5180Manager:
                 "tag_detected", "%s detected" % (protocol_label,),
                 uid=uid_list, protocol=protocol)
 
+            read_start = time.time()
             if protocol == "iso15693":
-                user_data = self.handler.iso15693_read_user_memory()
+                user_data = self.handler.iso15693_read_user_memory(
+                    batch_size=iso15693_batch)
             else:
                 user_data = self.handler.ntag_read_user_memory()
+            read_ms = int((time.time() - read_start) * 1000.0)
             if not user_data:
                 self.gcode.respond_info("No data on tag")
                 self._set_scan_status(
@@ -1182,6 +1310,7 @@ class PN5180Manager:
             preview = " ".join("%02X" % (b,) for b in user_data[:32])
             self.gcode.respond_info("Data preview: %s" % (preview,))
 
+            decode_start = time.time()
             data_str = self._decode_tag_user_data(user_data)
             data_preview = data_str[:120]
             if not data_str:
@@ -1199,6 +1328,7 @@ class PN5180Manager:
             json_end = data_str.rfind("}")
             if json_end > 0 and json_end < len(data_str) - 1:
                 data_str = data_str[:json_end + 1]
+            decode_ms = int((time.time() - decode_start) * 1000.0)
 
             spool_id = self._extract_spool_id(data_str)
             if spool_id:
@@ -1230,6 +1360,12 @@ class PN5180Manager:
                 for line in formatted.split("\n"):
                     self.gcode.respond_info("  %s" % (line,))
                 self.gcode.respond_info("=" * 50)
+                self._debug_profile_line({
+                    "detect_ms": detect_ms,
+                    "read_ms": read_ms,
+                    "decode_ms": decode_ms,
+                    "total_ms": int((time.time() - scan_start) * 1000.0),
+                })
                 self._debug_scan_line()
                 return formatted
             except json.JSONDecodeError:
@@ -1241,6 +1377,12 @@ class PN5180Manager:
                         cleaned.append("<0x%02X>" % (ord(ch),))
                 self.gcode.respond_info("Text data: %s" % ("".join(cleaned),))
                 self.gcode.respond_info("=" * 50)
+                self._debug_profile_line({
+                    "detect_ms": detect_ms,
+                    "read_ms": read_ms,
+                    "decode_ms": decode_ms,
+                    "total_ms": int((time.time() - scan_start) * 1000.0),
+                })
                 self._debug_scan_line()
                 return data_str
         except Exception as e:
@@ -1286,7 +1428,7 @@ class PN5180:
     def _init_service(self):
         self.service = PN5180Service(self.printer.get_reactor(), self.scan_period)
 
-    def read_begin(self):
+    def read_begin(self, iso15693_batch=1):
         if self.manager is None:
             self.gcode.respond_info("PN5180 manager is not initialized")
             return
@@ -1295,10 +1437,15 @@ class PN5180:
                 return
         if self.service is None:
             self._init_service()
-        self.service.schedule(func=self.manager.rfid_read)
+        self.service.schedule(
+            func=self.manager.rfid_read,
+            params={"iso15693_batch": iso15693_batch})
         ret = self.service.start()
-        self.gcode.respond_info(
-            "PN5180 read started." if ret else "PN5180 read is already running.")
+        if ret:
+            self.gcode.respond_info(
+                "PN5180 read started. ISO15693 batch=%d" % (iso15693_batch,))
+        else:
+            self.gcode.respond_info("PN5180 read is already running.")
 
     def read_end(self):
         if self.service is None:
@@ -1308,14 +1455,15 @@ class PN5180:
         self.gcode.respond_info(
             "PN5180 read stopped." if ret else "PN5180 read is not running.")
 
-    def scan_once(self):
+    def scan_once(self, iso15693_batch=1):
         if self.manager is None:
             self.gcode.respond_info("PN5180 manager is not initialized")
             return
         if not self.manager.handler.initialized:
             if not self.manager.initialize():
                 return
-        self.manager.rfid_read(report_no_tag=True)
+        self.manager.rfid_read(
+            report_no_tag=True, iso15693_batch=iso15693_batch)
 
     def get_status(self, eventtime):
         status = {
@@ -1475,6 +1623,7 @@ class PN5180:
         recover_flag = gcmd.get_int("RECOVER", 0)
         debug_flag = gcmd.get_int("DEBUG", None)
         happyhare_flag = gcmd.get_int("HAPPYHARE", None)
+        iso15693_batch = gcmd.get_int("ISO15693_BATCH", 1, minval=1, maxval=16)
 
         if happyhare_flag is not None:
             self.manager.happyhare_enable = bool(happyhare_flag)
@@ -1485,11 +1634,11 @@ class PN5180:
             self.gcode.respond_info("PN5180 debug log: %s" % (
                 self.manager.debug_log,))
         elif read_flag == 1:
-            self.read_begin()
+            self.read_begin(iso15693_batch=iso15693_batch)
         elif read_flag == 0:
             self.read_end()
         elif scan_flag == 1:
-            self.scan_once()
+            self.scan_once(iso15693_batch=iso15693_batch)
         elif init_flag == 1:
             self.manager.initialize()
         elif status_flag == 1:
@@ -1508,6 +1657,9 @@ class PN5180:
                     self.name,))
             self.gcode.respond_info(
                 "  PN5180 NAME=%s SCAN=1   - read once" % (self.name,))
+            self.gcode.respond_info(
+                "  PN5180 NAME=%s ISO15693_BATCH=4 SCAN=1   - debug ISO15693 batch read" % (
+                    self.name,))
             self.gcode.respond_info(
                 "  PN5180 NAME=%s STATUS=1 - show status" % (self.name,))
             self.gcode.respond_info(
