@@ -91,13 +91,16 @@ class PN5180Handler:
         self.rf_on_delay = config.getfloat("rf_on_delay", 0.05, minval=0.0)
         self.page_read_retries = config.getint("page_read_retries", 2, minval=1)
 
-        self.reset_pin = None
         reset_pin_name = config.get("reset_pin", None)
-        if reset_pin_name:
-            pins = printer.lookup_object("pins")
-            self.reset_pin = pins.setup_pin("digital_out", reset_pin_name)
-            self.reset_pin.setup_max_duration(0.0)
-            self.reset_pin.setup_start_value(1, 1)
+        if not reset_pin_name:
+            raise config.error(
+                "Option 'reset_pin' in section '%s' must be specified. "
+                "PN5180 RST must be connected to an MCU GPIO so Klipper can "
+                "recover the reader by hardware reset." % (config.get_name(),))
+        pins = printer.lookup_object("pins")
+        self.reset_pin = pins.setup_pin("digital_out", reset_pin_name)
+        self.reset_pin.setup_max_duration(0.0)
+        self.reset_pin.setup_start_value(1, 1)
 
         self.initialized = False
         self.firmware = None
@@ -225,8 +228,6 @@ class PN5180Handler:
         return False
 
     def hardware_reset(self):
-        if self.reset_pin is None:
-            return False
         eventtime = self.reactor.monotonic()
         print_time = self._mcu_print_time(eventtime) + RESET_SCHEDULE_DELAY
         self.reset_pin.set_digital(print_time, 0)
@@ -236,24 +237,6 @@ class PN5180Handler:
         self._wait_irq(IDLE_IRQ_STAT, timeout=1.0, raise_on_error=False)
         self.clear_irq_status(0xFFFFFFFF)
         return True
-
-    def software_recover(self, setup_rf=False):
-        ok = True
-        try:
-            self.rf_off()
-        except Exception:
-            ok = False
-        try:
-            self.write_register_and_mask(SYSTEM_CONFIG, 0xFFFFFFF8)
-            self.clear_irq_status(0xFFFFFFFF)
-        except Exception:
-            ok = False
-        if setup_rf:
-            try:
-                self.setup_type_a_rf()
-            except Exception:
-                ok = False
-        return ok
 
     def setup_type_a_rf(self):
         # PN5180 can stay in Receive/Transceive after a failed or completed tag
@@ -310,13 +293,9 @@ class PN5180Handler:
                 "all diagnostic registers read 0x00000000; check SPI MISO/CS/bus/power")
         return product, firmware, eeprom, registers
 
-    def initialize(self):
+    def initialize(self, announce=True):
         try:
-            if self.reset_pin is not None:
-                self.hardware_reset()
-            else:
-                self.software_recover()
-
+            self.hardware_reset()
             (self.product_version, self.firmware, self.eeprom_version,
              self.diag_registers) = self.check_communication()
             self.setup_type_a_rf()
@@ -324,8 +303,9 @@ class PN5180Handler:
             version = "%d.%d" % (self.firmware[1], self.firmware[0])
             diag = self._format_diag_summary()
             logging.info("PN5180 initialized: firmware v%s; %s", version, diag)
-            self.gcode.respond_info(
-                "PN5180 initialized: firmware v%s; %s" % (version, diag))
+            if announce:
+                self.gcode.respond_info(
+                    "PN5180 initialized: firmware v%s; %s" % (version, diag))
             return True
         except PN5180Error as e:
             self.initialized = False
@@ -373,8 +353,7 @@ class PN5180Handler:
         self.write_register_and_mask(CRC_TX_CONFIG, 0xFFFFFFFE)
 
         self.send_data([0x52 if wakeup else 0x26], valid_bits=0x07)
-        timeout = max(self.rf_timeout, self.rf_timeout * block_count)
-        if not self._wait_irq(RX_IRQ_STAT, timeout=timeout,
+        if not self._wait_irq(RX_IRQ_STAT, timeout=self.rf_timeout,
                               raise_on_error=False):
             logging.debug("PN5180 no ATQA response")
             return None
@@ -493,7 +472,7 @@ class PN5180Handler:
             return True, tag["uid"]
         except Exception as e:
             logging.debug("PN5180 tag detection failed: %s", e)
-            self.software_recover()
+            self.initialize(announce=False)
             self.current_uid = None
             self.current_uid_lsb_first = None
             self.current_uid_hex = ""
@@ -540,7 +519,7 @@ class PN5180Handler:
             return True, tag["uid"]
         except Exception as e:
             logging.debug("PN5180 ISO15693 detection failed: %s", e)
-            self.software_recover()
+            self.initialize(announce=False)
             self.current_uid = None
             self.current_uid_lsb_first = None
             self.current_uid_hex = ""
@@ -686,7 +665,7 @@ class PN5180Handler:
                 logging.debug("PN5180 read page %d attempt %d failed: %s",
                               page, attempt + 1, e)
                 if attempt + 1 < self.page_read_retries:
-                    self.software_recover()
+                    self.initialize(announce=False)
                     if not self.activate_type_a(wakeup=True):
                         last_error = PN5180Error(
                             "tag lost while retrying page %d" % (page,))
@@ -971,27 +950,26 @@ class PN5180Manager:
         except Exception as e:
             message = (
                 "PN5180 communication lost: %s. "
-                "SPI reads are invalid; reset_pin or PN5180 power cycle is required."
+                "SPI reads are invalid; trying hardware reset."
                 % (e,))
             logging.warning(message)
 
-            if self.handler.reset_pin is not None:
-                self.gcode.respond_info(
-                    "PN5180 communication watchdog triggered; trying hardware reset.")
-                if self.handler.initialize():
-                    self.consecutive_no_tag = 0
-                    self.communication_lost = False
-                    self.communication_lost_notice_sent = False
-                    self._set_scan_status(
-                        "comm_recovered",
-                        "PN5180 recovered by hardware reset")
-                    return True
+            self.gcode.respond_info(
+                "PN5180 communication watchdog triggered; trying hardware reset.")
+            if self.handler.initialize():
+                self.consecutive_no_tag = 0
+                self.communication_lost = False
+                self.communication_lost_notice_sent = False
+                self._set_scan_status(
+                    "comm_recovered",
+                    "PN5180 recovered by hardware reset")
+                return True
 
             self.communication_lost = True
             self.handler.initialized = False
             self._set_scan_status(
                 "comm_lost",
-                "PN5180 SPI reads invalid; reset_pin or power cycle required",
+                "PN5180 SPI reads invalid after hardware reset",
                 error=str(e))
             if not self.communication_lost_notice_sent:
                 self.gcode.respond_info(message)
@@ -1213,12 +1191,15 @@ class PN5180Manager:
         self._set_scan_status(
             "scanning", self._scan_message(), protocol="", add_event=False)
         try:
-            if self.communication_lost and self.handler.reset_pin is None:
+            if self.communication_lost:
                 self._set_scan_status(
                     "comm_lost",
-                    "PN5180 SPI reads invalid; reset_pin or power cycle required")
-                self._debug_scan_line()
-                return None
+                    "PN5180 SPI reads invalid; trying hardware reset")
+                if not self.handler.initialize():
+                    self._debug_scan_line()
+                    return None
+                self.communication_lost = False
+                self.communication_lost_notice_sent = False
 
             if self.waiting_for_removal:
                 tag = self._detect_tag()
@@ -1394,7 +1375,7 @@ class PN5180Manager:
             self.gcode.respond_info("Error reading PN5180 tag: %s" % (e,))
             logging.exception("PN5180 read failed: %s", e)
             self._set_scan_status("error", "Read failed", error=str(e))
-            self.handler.software_recover()
+            self.handler.initialize(announce=False)
             self._debug_scan_line()
             return None
 
@@ -1607,23 +1588,14 @@ class PN5180:
         if self.manager is None:
             self.gcode.respond_info("PN5180 manager is not initialized")
             return
-        handler = self.manager.handler
-        if handler.reset_pin is not None:
-            ok = handler.hardware_reset()
-            action = "hardware reset"
-            if ok:
-                try:
-                    handler.setup_type_a_rf()
-                except Exception:
-                    ok = False
-        else:
-            ok = handler.software_recover(setup_rf=True)
-            action = "software RF recovery"
+        ok = self.manager.initialize()
         if ok:
-            self.gcode.respond_info("PN5180 %s complete." % (action,))
+            self.manager.communication_lost = False
+            self.manager.communication_lost_notice_sent = False
+            self.gcode.respond_info("PN5180 hardware reset complete.")
         else:
             self.gcode.respond_info(
-                "PN5180 %s finished with errors; run DIAG=1." % (action,))
+                "PN5180 hardware reset failed; run DIAG=1 and check power/SPI/RST.")
 
     def cmd_PN5180(self, gcmd):
         read_flag = gcmd.get_int("READ", None)
@@ -1680,7 +1652,7 @@ class PN5180:
                 "  PN5180 NAME=%s DIAG=1   - read diagnostic registers" % (
                     self.name,))
             self.gcode.respond_info(
-                "  PN5180 NAME=%s RECOVER=1 - reset PN5180 RF state" % (
+                "  PN5180 NAME=%s RECOVER=1 - hardware reset PN5180" % (
                     self.name,))
             self.gcode.respond_info(
                 "  PN5180 NAME=%s DEBUG=1  - enable per-scan debug output" % (
