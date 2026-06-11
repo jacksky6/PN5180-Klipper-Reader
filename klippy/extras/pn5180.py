@@ -577,16 +577,95 @@ class PN5180Service:
 class PN5180Manager:
     def __init__(self, printer, spi, config):
         self.printer = printer
+        self.reactor = printer.get_reactor()
         self.gcode = printer.lookup_object("gcode")
         self.handler = PN5180Handler(printer, spi, config)
         self.start_page = config.getint("start_page", 4, minval=0)
         self.end_page = config.getint("end_page", 67, minval=0)
+        self.debug_log = config.getboolean("debug_log", True)
         self.last_uid = None
         self.waiting_for_removal = False
         self.waiting_notice_sent = False
+        self.scan_count = 0
+        self.last_scan_time = 0.0
+        self.last_scan_result = "idle"
+        self.last_scan_message = ""
+        self.last_error = ""
+        self.last_uid_hex = ""
+        self.last_spool_id = ""
+        self.last_data_preview = ""
+        self.recent_events = []
 
     def initialize(self):
         return self.handler.initialize()
+
+    def _now(self):
+        return self.reactor.monotonic()
+
+    def _uid_hex(self, uid):
+        return " ".join("%02X" % (b,) for b in uid)
+
+    def _add_event(self, result, message="", uid=None, spool_id=""):
+        event = {
+            "time": self._now(),
+            "result": result,
+            "message": message,
+            "uid": self._uid_hex(uid) if uid else "",
+            "spool_id": spool_id or "",
+        }
+        self.recent_events.append(event)
+        self.recent_events = self.recent_events[-12:]
+
+    def _set_scan_status(self, result, message="", uid=None, spool_id="",
+                         error="", data_preview=None, add_event=True):
+        self.last_scan_time = self._now()
+        self.last_scan_result = result
+        self.last_scan_message = message
+        self.last_error = error or ""
+        if uid is not None:
+            self.last_uid_hex = self._uid_hex(uid)
+        if spool_id:
+            self.last_spool_id = spool_id
+        if data_preview is not None:
+            self.last_data_preview = data_preview
+        if add_event:
+            self._add_event(result, message, uid=uid, spool_id=spool_id)
+
+    def _debug_scan_line(self):
+        if not self.debug_log:
+            return
+        parts = [
+            "PN5180 scan #%d:" % (self.scan_count,),
+            self.last_scan_result,
+        ]
+        if self.last_scan_message:
+            parts.append(self.last_scan_message)
+        if self.last_uid_hex:
+            parts.append("uid=%s" % (self.last_uid_hex,))
+        if self.last_spool_id:
+            parts.append("spool_id=%s" % (self.last_spool_id,))
+        if self.waiting_for_removal:
+            parts.append("waiting_removal=1")
+        if self.last_error:
+            parts.append("error=%s" % (self.last_error,))
+        line = " ".join(parts)
+        self.gcode.respond_info(line)
+        logging.info(line)
+
+    def get_status(self):
+        return {
+            "debug_log": self.debug_log,
+            "scan_count": self.scan_count,
+            "last_scan_time": self.last_scan_time,
+            "last_scan_result": self.last_scan_result,
+            "last_scan_message": self.last_scan_message,
+            "last_error": self.last_error,
+            "last_uid": self.last_uid_hex,
+            "last_spool_id": self.last_spool_id,
+            "last_data_preview": self.last_data_preview,
+            "waiting_for_removal": self.waiting_for_removal,
+            "recent_events": list(self.recent_events),
+        }
 
     def _search_spool_id_in_obj(self, obj):
         if isinstance(obj, dict):
@@ -635,22 +714,37 @@ class PN5180Manager:
                 "HappyHare spool ID found: %s. Command dispatched." % (
                     spool_id,))
             logging.info("PN5180 dispatched command: %s", command)
+            return True
         except Exception as e:
             logging.exception("Failed to dispatch spool ID '%s': %s", spool_id, e)
             self.gcode.respond_info(
                 "Failed to apply spool ID '%s'. Check logs." % (spool_id,))
+            self._set_scan_status(
+                "dispatch_error",
+                "Failed to dispatch spool ID",
+                spool_id=spool_id,
+                error=str(e))
+            return False
 
     def rfid_read(self, report_no_tag=False):
+        self.scan_count += 1
+        self._set_scan_status("scanning", "Scanning for NTAG", add_event=False)
         try:
             if self.waiting_for_removal:
                 success, uid = self.handler.read_passive_target_id(timeout=0.5)
                 if success and uid:
                     uid_list = list(uid)
                     if self.last_uid and uid_list == self.last_uid:
+                        self._set_scan_status(
+                            "waiting_removal",
+                            "Tag already processed; waiting for removal",
+                            uid=uid_list,
+                            add_event=False)
                         if not self.waiting_notice_sent:
                             self.gcode.respond_info(
                                 "Tag already processed. Remove it before re-reading.")
                             self.waiting_notice_sent = True
+                        self._debug_scan_line()
                         return None
 
                     self.waiting_for_removal = False
@@ -659,15 +753,21 @@ class PN5180Manager:
                 else:
                     if self.waiting_notice_sent:
                         self.gcode.respond_info("Tag removed. Reader is ready.")
+                    self._set_scan_status(
+                        "tag_removed", "Tag removed; reader ready")
                     self.waiting_for_removal = False
                     self.waiting_notice_sent = False
                     self.last_uid = None
+                    self._debug_scan_line()
                     return None
 
             success, uid = self.handler.read_passive_target_id(timeout=0.5)
             if not success or not uid:
+                self._set_scan_status(
+                    "no_tag", "No NTAG detected", add_event=report_no_tag)
                 if report_no_tag:
                     self.gcode.respond_info("PN5180 scan complete: no tag detected")
+                self._debug_scan_line()
                 return None
 
             uid_list = list(uid)
@@ -676,11 +776,14 @@ class PN5180Manager:
             self.gcode.respond_info("PN5180 NTAG detected")
             self.gcode.respond_info("Card UID: %s" % (uid_str,))
             logging.info("PN5180 card detected UID=%s", uid_str)
+            self._set_scan_status("tag_detected", "NTAG detected", uid=uid_list)
 
             user_data = self.handler.ntag_read_user_memory(
                 start_page=self.start_page, end_page=self.end_page)
             if not user_data:
                 self.gcode.respond_info("No data on tag")
+                self._set_scan_status("empty_tag", "No data on tag", uid=uid_list)
+                self._debug_scan_line()
                 return None
 
             self.last_uid = uid_list
@@ -691,8 +794,13 @@ class PN5180Manager:
             self.gcode.respond_info("Data preview: %s" % (preview,))
 
             data_str = user_data.decode("utf-8", errors="ignore").rstrip("\x00").strip()
+            data_preview = data_str[:120]
             if not data_str:
                 self.gcode.respond_info("Tag is empty")
+                self._set_scan_status(
+                    "empty_tag", "Tag is empty", uid=uid_list,
+                    data_preview=data_preview)
+                self._debug_scan_line()
                 return None
 
             json_start = data_str.find("{")
@@ -705,9 +813,20 @@ class PN5180Manager:
 
             spool_id = self._extract_spool_id(data_str)
             if spool_id:
-                self._apply_spool_id(spool_id)
+                if self._apply_spool_id(spool_id):
+                    self._set_scan_status(
+                        "spool_applied",
+                        "Spool ID applied",
+                        uid=uid_list,
+                        spool_id=spool_id,
+                        data_preview=data_preview)
             else:
                 self.gcode.respond_info("No HappyHare spool ID found in tag data.")
+                self._set_scan_status(
+                    "no_spool_id",
+                    "No HappyHare spool ID found",
+                    uid=uid_list,
+                    data_preview=data_preview)
 
             try:
                 data_json = json.loads(data_str)
@@ -716,6 +835,7 @@ class PN5180Manager:
                 for line in formatted.split("\n"):
                     self.gcode.respond_info("  %s" % (line,))
                 self.gcode.respond_info("=" * 50)
+                self._debug_scan_line()
                 return formatted
             except json.JSONDecodeError:
                 cleaned = []
@@ -726,11 +846,14 @@ class PN5180Manager:
                         cleaned.append("<0x%02X>" % (ord(ch),))
                 self.gcode.respond_info("Text data: %s" % ("".join(cleaned),))
                 self.gcode.respond_info("=" * 50)
+                self._debug_scan_line()
                 return data_str
         except Exception as e:
             self.gcode.respond_info("Error reading PN5180 tag: %s" % (e,))
             logging.exception("PN5180 read failed: %s", e)
+            self._set_scan_status("error", "Read failed", error=str(e))
             self.handler.software_recover()
+            self._debug_scan_line()
             return None
 
 
@@ -799,6 +922,36 @@ class PN5180:
                 return
         self.manager.rfid_read(report_no_tag=True)
 
+    def get_status(self, eventtime):
+        status = {
+            "name": self.name,
+            "reading": bool(self.service and self.service.running),
+            "scan_period": self.scan_period,
+        }
+        if self.manager is None:
+            status.update({
+                "initialized": False,
+                "debug_log": False,
+                "scan_count": 0,
+                "last_scan_result": "not_initialized",
+                "last_scan_message": "PN5180 manager is not initialized",
+                "last_error": "",
+                "last_uid": "",
+                "last_spool_id": "",
+                "last_data_preview": "",
+                "waiting_for_removal": False,
+                "recent_events": [],
+            })
+            return status
+        handler = self.manager.handler
+        status.update(self.manager.get_status())
+        status.update({
+            "initialized": handler.initialized,
+            "firmware": ("%d.%d" % (handler.firmware[1], handler.firmware[0])
+                         if handler.firmware else ""),
+        })
+        return status
+
     def show_status(self):
         if self.manager is None:
             self.gcode.respond_info("PN5180 manager is not initialized")
@@ -819,6 +972,34 @@ class PN5180:
                 handler._format_bytes(handler.eeprom_version),))
         if handler.current_uid_hex:
             self.gcode.respond_info("Last UID: %s" % (handler.current_uid_hex,))
+        status = self.manager.get_status()
+        self.gcode.respond_info("PN5180 reading: %s" % (
+            bool(self.service and self.service.running),))
+        self.gcode.respond_info("PN5180 debug log: %s" % (
+            status["debug_log"],))
+        self.gcode.respond_info("PN5180 scan count: %d" % (
+            status["scan_count"],))
+        self.gcode.respond_info("PN5180 last result: %s - %s" % (
+            status["last_scan_result"], status["last_scan_message"]))
+        if status["last_uid"]:
+            self.gcode.respond_info("PN5180 last UID: %s" % (status["last_uid"],))
+        if status["last_spool_id"]:
+            self.gcode.respond_info("PN5180 last spool ID: %s" % (
+                status["last_spool_id"],))
+        if status["last_error"]:
+            self.gcode.respond_info("PN5180 last error: %s" % (
+                status["last_error"],))
+        if status["recent_events"]:
+            self.gcode.respond_info("PN5180 recent events:")
+            for event in status["recent_events"][-5:]:
+                detail = event["result"]
+                if event["uid"]:
+                    detail += " uid=%s" % (event["uid"],)
+                if event["spool_id"]:
+                    detail += " spool_id=%s" % (event["spool_id"],)
+                if event["message"]:
+                    detail += " - %s" % (event["message"],)
+                self.gcode.respond_info("  %s" % (detail,))
 
     def run_diag(self):
         if self.manager is None:
@@ -878,8 +1059,13 @@ class PN5180:
         status_flag = gcmd.get_int("STATUS", 0)
         diag_flag = gcmd.get_int("DIAG", 0)
         recover_flag = gcmd.get_int("RECOVER", 0)
+        debug_flag = gcmd.get_int("DEBUG", None)
 
-        if read_flag == 1:
+        if debug_flag is not None:
+            self.manager.debug_log = bool(debug_flag)
+            self.gcode.respond_info("PN5180 debug log: %s" % (
+                self.manager.debug_log,))
+        elif read_flag == 1:
             self.read_begin()
         elif read_flag == 0:
             self.read_end()
@@ -910,6 +1096,12 @@ class PN5180:
                     self.name,))
             self.gcode.respond_info(
                 "  PN5180 NAME=%s RECOVER=1 - reset PN5180 RF state" % (
+                    self.name,))
+            self.gcode.respond_info(
+                "  PN5180 NAME=%s DEBUG=1  - enable per-scan debug output" % (
+                    self.name,))
+            self.gcode.respond_info(
+                "  PN5180 NAME=%s DEBUG=0  - disable per-scan debug output" % (
                     self.name,))
 
 
