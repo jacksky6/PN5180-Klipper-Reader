@@ -584,9 +584,14 @@ class PN5180Manager:
         self.end_page = config.getint("end_page", 67, minval=0)
         self.debug_log = config.getboolean("debug_log", True)
         self.happyhare_enable = config.getboolean("happyhare_enable", True)
+        self.comm_check_interval = config.getint(
+            "comm_check_interval", 10, minval=0)
         self.last_uid = None
         self.waiting_for_removal = False
         self.waiting_notice_sent = False
+        self.consecutive_no_tag = 0
+        self.communication_lost = False
+        self.communication_lost_notice_sent = False
         self.scan_count = 0
         self.last_scan_time = 0.0
         self.last_scan_result = "idle"
@@ -653,10 +658,56 @@ class PN5180Manager:
         self.gcode.respond_info(line)
         logging.info(line)
 
+    def _communication_watchdog(self):
+        if not self.comm_check_interval:
+            return True
+        if self.consecutive_no_tag < self.comm_check_interval:
+            return True
+        if self.consecutive_no_tag % self.comm_check_interval:
+            return True
+
+        try:
+            self.handler.check_communication()
+            self.communication_lost = False
+            self.communication_lost_notice_sent = False
+            return True
+        except Exception as e:
+            message = (
+                "PN5180 communication lost: %s. "
+                "SPI reads are invalid; reset_pin or PN5180 power cycle is required."
+                % (e,))
+            logging.warning(message)
+
+            if self.handler.reset_pin is not None:
+                self.gcode.respond_info(
+                    "PN5180 communication watchdog triggered; trying hardware reset.")
+                if self.handler.initialize():
+                    self.consecutive_no_tag = 0
+                    self.communication_lost = False
+                    self.communication_lost_notice_sent = False
+                    self._set_scan_status(
+                        "comm_recovered",
+                        "PN5180 recovered by hardware reset")
+                    return True
+
+            self.communication_lost = True
+            self.handler.initialized = False
+            self._set_scan_status(
+                "comm_lost",
+                "PN5180 SPI reads invalid; reset_pin or power cycle required",
+                error=str(e))
+            if not self.communication_lost_notice_sent:
+                self.gcode.respond_info(message)
+                self.communication_lost_notice_sent = True
+            return False
+
     def get_status(self):
         return {
             "debug_log": self.debug_log,
             "happyhare_enable": self.happyhare_enable,
+            "comm_check_interval": self.comm_check_interval,
+            "consecutive_no_tag": self.consecutive_no_tag,
+            "communication_lost": self.communication_lost,
             "scan_count": self.scan_count,
             "last_scan_time": self.last_scan_time,
             "last_scan_result": self.last_scan_result,
@@ -815,9 +866,17 @@ class PN5180Manager:
         self.scan_count += 1
         self._set_scan_status("scanning", "Scanning for NTAG", add_event=False)
         try:
+            if self.communication_lost and self.handler.reset_pin is None:
+                self._set_scan_status(
+                    "comm_lost",
+                    "PN5180 SPI reads invalid; reset_pin or power cycle required")
+                self._debug_scan_line()
+                return None
+
             if self.waiting_for_removal:
                 success, uid = self.handler.read_passive_target_id(timeout=0.5)
                 if success and uid:
+                    self.consecutive_no_tag = 0
                     uid_list = list(uid)
                     if self.last_uid and uid_list == self.last_uid:
                         self._set_scan_status(
@@ -836,6 +895,7 @@ class PN5180Manager:
                     self.waiting_notice_sent = False
                     self.last_uid = None
                 else:
+                    self.consecutive_no_tag += 1
                     if self.waiting_notice_sent:
                         self.gcode.respond_info("Tag removed. Reader is ready.")
                     self._set_scan_status(
@@ -843,18 +903,26 @@ class PN5180Manager:
                     self.waiting_for_removal = False
                     self.waiting_notice_sent = False
                     self.last_uid = None
+                    self._communication_watchdog()
                     self._debug_scan_line()
                     return None
 
             success, uid = self.handler.read_passive_target_id(timeout=0.5)
             if not success or not uid:
+                self.consecutive_no_tag += 1
                 self._set_scan_status(
                     "no_tag", "No NTAG detected", add_event=report_no_tag)
+                if not self._communication_watchdog():
+                    self._debug_scan_line()
+                    return None
                 if report_no_tag:
                     self.gcode.respond_info("PN5180 scan complete: no tag detected")
                 self._debug_scan_line()
                 return None
 
+            self.consecutive_no_tag = 0
+            self.communication_lost = False
+            self.communication_lost_notice_sent = False
             uid_list = list(uid)
             uid_str = " ".join("%02X" % (b,) for b in uid_list)
             self.gcode.respond_info("=" * 50)
@@ -1022,6 +1090,9 @@ class PN5180:
                 "initialized": False,
                 "debug_log": False,
                 "happyhare_enable": False,
+                "comm_check_interval": 0,
+                "consecutive_no_tag": 0,
+                "communication_lost": False,
                 "scan_count": 0,
                 "last_scan_result": "not_initialized",
                 "last_scan_message": "PN5180 manager is not initialized",
@@ -1069,6 +1140,10 @@ class PN5180:
             status["debug_log"],))
         self.gcode.respond_info("PN5180 HappyHare dispatch: %s" % (
             status["happyhare_enable"],))
+        self.gcode.respond_info("PN5180 communication lost: %s" % (
+            status["communication_lost"],))
+        self.gcode.respond_info("PN5180 consecutive no-tag scans: %d" % (
+            status["consecutive_no_tag"],))
         self.gcode.respond_info("PN5180 scan count: %d" % (
             status["scan_count"],))
         self.gcode.respond_info("PN5180 last result: %s - %s" % (
