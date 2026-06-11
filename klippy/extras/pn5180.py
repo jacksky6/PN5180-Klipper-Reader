@@ -683,6 +683,81 @@ class PN5180Manager:
                     return nested
         return None
 
+    def _decode_ndef_text_record(self, data):
+        pos = 0
+        while pos + 3 <= len(data):
+            header = data[pos]
+            type_len = data[pos + 1]
+            short_record = bool(header & 0x10)
+            has_id = bool(header & 0x08)
+            pos += 2
+            if short_record:
+                if pos >= len(data):
+                    return None
+                payload_len = data[pos]
+                pos += 1
+            else:
+                if pos + 4 > len(data):
+                    return None
+                payload_len = ((data[pos] << 24) | (data[pos + 1] << 16)
+                               | (data[pos + 2] << 8) | data[pos + 3])
+                pos += 4
+            id_len = 0
+            if has_id:
+                if pos >= len(data):
+                    return None
+                id_len = data[pos]
+                pos += 1
+            if pos + type_len + id_len + payload_len > len(data):
+                return None
+            record_type = data[pos:pos + type_len]
+            pos += type_len + id_len
+            payload = data[pos:pos + payload_len]
+            pos += payload_len
+
+            if record_type == b"T" and payload:
+                status = payload[0]
+                lang_len = status & 0x3F
+                if 1 + lang_len <= len(payload):
+                    text = payload[1 + lang_len:]
+                    encoding = "utf-16" if status & 0x80 else "utf-8"
+                    return text.decode(encoding, errors="replace").strip()
+            if header & 0x40:
+                break
+        return None
+
+    def _decode_ntag_user_data(self, user_data):
+        data = bytes(user_data)
+        pos = 0
+        while pos < len(data):
+            tlv_type = data[pos]
+            pos += 1
+            if tlv_type == 0x00:
+                continue
+            if tlv_type == 0xFE:
+                break
+            if pos >= len(data):
+                break
+            tlv_len = data[pos]
+            pos += 1
+            if tlv_len == 0xFF:
+                if pos + 2 > len(data):
+                    break
+                tlv_len = (data[pos] << 8) | data[pos + 1]
+                pos += 2
+            value = data[pos:pos + tlv_len]
+            pos += tlv_len
+            if tlv_type == 0x03:
+                text = self._decode_ndef_text_record(value)
+                if text:
+                    return text
+                return value.decode("utf-8", errors="ignore").strip()
+
+        terminator = data.find(b"\xFE")
+        if terminator >= 0:
+            data = data[:terminator]
+        return data.decode("utf-8", errors="ignore").rstrip("\x00").strip()
+
     def _extract_spool_id(self, data_str):
         if not data_str:
             return None
@@ -697,7 +772,7 @@ class PN5180Manager:
             pass
 
         pattern = re.compile(
-            r'"?(?:spool_id|spool|filament)"?\s*[:=]\s*["`]?([0-9A-Za-z_\-\s]+)["`]?',
+            r'"?(?:spool_id|spool|filament)"?\s*[:=]\s*["`]?([0-9A-Za-z_\-]+)',
             re.IGNORECASE | re.DOTALL)
         match = pattern.search(text)
         if match:
@@ -793,7 +868,7 @@ class PN5180Manager:
             preview = " ".join("%02X" % (b,) for b in user_data[:32])
             self.gcode.respond_info("Data preview: %s" % (preview,))
 
-            data_str = user_data.decode("utf-8", errors="ignore").rstrip("\x00").strip()
+            data_str = self._decode_ntag_user_data(user_data)
             data_preview = data_str[:120]
             if not data_str:
                 self.gcode.respond_info("Tag is empty")
