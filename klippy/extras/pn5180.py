@@ -462,21 +462,13 @@ class PN5180Handler:
     def read_passive_target_id(self, timeout=0.5):
         if not self.initialized:
             return False, None
-        try:
-            tag = self.activate_type_a(wakeup=True)
-            if not tag:
-                self.current_uid = None
-                self.current_uid_lsb_first = None
-                self.current_uid_hex = ""
-                return False, None
-            return True, tag["uid"]
-        except Exception as e:
-            logging.debug("PN5180 tag detection failed: %s", e)
-            self.initialize(announce=False)
+        tag = self.activate_type_a(wakeup=True)
+        if not tag:
             self.current_uid = None
             self.current_uid_lsb_first = None
             self.current_uid_hex = ""
             return False, None
+        return True, tag["uid"]
 
     def iso15693_inventory(self):
         self.setup_iso15693_rf()
@@ -509,21 +501,13 @@ class PN5180Handler:
     def read_iso15693_target_id(self):
         if not self.initialized:
             return False, None
-        try:
-            tag = self.iso15693_inventory()
-            if not tag:
-                self.current_uid = None
-                self.current_uid_lsb_first = None
-                self.current_uid_hex = ""
-                return False, None
-            return True, tag["uid"]
-        except Exception as e:
-            logging.debug("PN5180 ISO15693 detection failed: %s", e)
-            self.initialize(announce=False)
+        tag = self.iso15693_inventory()
+        if not tag:
             self.current_uid = None
             self.current_uid_lsb_first = None
             self.current_uid_hex = ""
             return False, None
+        return True, tag["uid"]
 
     def iso15693_read_single_block(self, block):
         self.send_data([
@@ -829,15 +813,10 @@ class PN5180Manager:
         self.happyhare_enable = config.getboolean("happyhare_enable", True)
         self.iso15693_blocks_per_read = config.getint(
             "iso15693_blocks_per_read", 8, minval=1, maxval=16)
-        self.comm_check_interval = config.getint(
-            "comm_check_interval", 10, minval=0)
         self.last_uid = None
         self.last_tag_protocol = ""
         self.waiting_for_removal = False
         self.waiting_notice_sent = False
-        self.consecutive_no_tag = 0
-        self.communication_lost = False
-        self.communication_lost_notice_sent = False
         self.scan_count = 0
         self.last_scan_time = 0.0
         self.last_scan_result = "idle"
@@ -934,57 +913,12 @@ class PN5180Manager:
         self.gcode.respond_info(line)
         logging.info(line)
 
-    def _communication_watchdog(self):
-        if not self.comm_check_interval:
-            return True
-        if self.consecutive_no_tag < self.comm_check_interval:
-            return True
-        if self.consecutive_no_tag % self.comm_check_interval:
-            return True
-
-        try:
-            self.handler.check_communication()
-            self.communication_lost = False
-            self.communication_lost_notice_sent = False
-            return True
-        except Exception as e:
-            message = (
-                "PN5180 communication lost: %s. "
-                "SPI reads are invalid; trying hardware reset."
-                % (e,))
-            logging.warning(message)
-
-            self.gcode.respond_info(
-                "PN5180 communication watchdog triggered; trying hardware reset.")
-            if self.handler.initialize():
-                self.consecutive_no_tag = 0
-                self.communication_lost = False
-                self.communication_lost_notice_sent = False
-                self._set_scan_status(
-                    "comm_recovered",
-                    "PN5180 recovered by hardware reset")
-                return True
-
-            self.communication_lost = True
-            self.handler.initialized = False
-            self._set_scan_status(
-                "comm_lost",
-                "PN5180 SPI reads invalid after hardware reset",
-                error=str(e))
-            if not self.communication_lost_notice_sent:
-                self.gcode.respond_info(message)
-                self.communication_lost_notice_sent = True
-            return False
-
     def get_status(self):
         return {
             "tag_protocol": self.tag_protocol,
             "debug_log": self.debug_log,
             "happyhare_enable": self.happyhare_enable,
             "iso15693_blocks_per_read": self.iso15693_blocks_per_read,
-            "comm_check_interval": self.comm_check_interval,
-            "consecutive_no_tag": self.consecutive_no_tag,
-            "communication_lost": self.communication_lost,
             "scan_count": self.scan_count,
             "last_scan_time": self.last_scan_time,
             "last_scan_result": self.last_scan_result,
@@ -1183,199 +1117,200 @@ class PN5180Manager:
                 error=str(e))
             return False
 
-    def rfid_read(self, report_no_tag=False):
+    def _rfid_read_once(self, report_no_tag=False):
         scan_start = time.time()
         self.scan_count += 1
         self._set_scan_status(
             "scanning", self._scan_message(), protocol="", add_event=False)
-        try:
-            if self.communication_lost:
-                self._set_scan_status(
-                    "comm_lost",
-                    "PN5180 SPI reads invalid; trying hardware reset")
-                if not self.handler.initialize():
-                    self._debug_scan_line()
-                    return None
-                self.communication_lost = False
-                self.communication_lost_notice_sent = False
-
-            if self.waiting_for_removal:
-                tag = self._detect_tag()
-                if tag:
-                    self.consecutive_no_tag = 0
-                    uid_list = tag["uid"]
-                    protocol = tag["protocol"]
-                    if (self.last_uid and uid_list == self.last_uid
-                            and protocol == self.last_tag_protocol):
-                        self._set_scan_status(
-                            "waiting_removal",
-                            "Tag already processed; waiting for removal",
-                            uid=uid_list,
-                            protocol=protocol,
-                            add_event=False)
-                        if not self.waiting_notice_sent:
-                            self.gcode.respond_info(
-                                "Tag already processed. Remove it before re-reading.")
-                            self.waiting_notice_sent = True
-                        self._debug_scan_line()
-                        return None
-
-                    self.waiting_for_removal = False
-                    self.waiting_notice_sent = False
-                    self.last_uid = None
-                    self.last_tag_protocol = ""
-                else:
-                    self.consecutive_no_tag += 1
-                    if self.waiting_notice_sent:
-                        self.gcode.respond_info("Tag removed. Reader is ready.")
-                    self._set_scan_status(
-                        "tag_removed", "Tag removed; reader ready",
-                        protocol="")
-                    self.waiting_for_removal = False
-                    self.waiting_notice_sent = False
-                    self.last_uid = None
-                    self.last_tag_protocol = ""
-                    self._communication_watchdog()
-                    self._debug_scan_line()
-                    return None
-
-            detect_start = time.time()
+        if self.waiting_for_removal:
             tag = self._detect_tag()
-            detect_ms = int((time.time() - detect_start) * 1000.0)
-            if not tag:
-                self.consecutive_no_tag += 1
-                self._set_scan_status(
-                    "no_tag", "No supported tag detected", protocol="",
-                    add_event=report_no_tag)
-                if not self._communication_watchdog():
+            if tag:
+                uid_list = tag["uid"]
+                protocol = tag["protocol"]
+                if (self.last_uid and uid_list == self.last_uid
+                        and protocol == self.last_tag_protocol):
+                    self._set_scan_status(
+                        "waiting_removal",
+                        "Tag already processed; waiting for removal",
+                        uid=uid_list,
+                        protocol=protocol,
+                        add_event=False)
+                    if not self.waiting_notice_sent:
+                        self.gcode.respond_info(
+                            "Tag already processed. Remove it before re-reading.")
+                        self.waiting_notice_sent = True
                     self._debug_scan_line()
                     return None
-                if report_no_tag:
-                    self.gcode.respond_info("PN5180 scan complete: no tag detected")
+
+                self.waiting_for_removal = False
+                self.waiting_notice_sent = False
+                self.last_uid = None
+                self.last_tag_protocol = ""
+            else:
+                if self.waiting_notice_sent:
+                    self.gcode.respond_info("Tag removed. Reader is ready.")
+                self._set_scan_status(
+                    "tag_removed", "Tag removed; reader ready",
+                    protocol="")
+                self.waiting_for_removal = False
+                self.waiting_notice_sent = False
+                self.last_uid = None
+                self.last_tag_protocol = ""
                 self._debug_scan_line()
                 return None
 
-            self.consecutive_no_tag = 0
-            self.communication_lost = False
-            self.communication_lost_notice_sent = False
-            protocol = tag["protocol"]
-            protocol_label = self._protocol_label(protocol)
-            uid_list = tag["uid"]
-            uid_str = " ".join("%02X" % (b,) for b in uid_list)
-            self.gcode.respond_info("=" * 50)
-            self.gcode.respond_info("PN5180 %s detected" % (protocol_label,))
-            self.gcode.respond_info("Card UID: %s" % (uid_str,))
-            logging.info(
-                "PN5180 %s card detected UID=%s", protocol_label, uid_str)
+        detect_start = time.time()
+        tag = self._detect_tag()
+        detect_ms = int((time.time() - detect_start) * 1000.0)
+        if not tag:
             self._set_scan_status(
-                "tag_detected", "%s detected" % (protocol_label,),
-                uid=uid_list, protocol=protocol)
-
-            read_start = time.time()
-            if protocol == "iso15693":
-                user_data = self.handler.iso15693_read_user_memory(
-                    batch_size=self.iso15693_blocks_per_read)
-            else:
-                user_data = self.handler.ntag_read_user_memory()
-            read_ms = int((time.time() - read_start) * 1000.0)
-            if not user_data:
-                self.gcode.respond_info("No data on tag")
-                self._set_scan_status(
-                    "empty_tag", "No data on tag", uid=uid_list,
-                    protocol=protocol)
-                self._debug_scan_line()
-                return None
-
-            self.last_uid = uid_list
-            self.last_tag_protocol = protocol
-            self.waiting_for_removal = True
-            self.waiting_notice_sent = False
-
-            preview = " ".join("%02X" % (b,) for b in user_data[:32])
-            self.gcode.respond_info("Data preview: %s" % (preview,))
-
-            decode_start = time.time()
-            data_str = self._decode_tag_user_data(user_data)
-            data_preview = data_str[:120]
-            if not data_str:
-                self.gcode.respond_info("Tag is empty")
-                self._set_scan_status(
-                    "empty_tag", "Tag is empty", uid=uid_list,
-                    data_preview=data_preview, protocol=protocol)
-                self._debug_scan_line()
-                return None
-
-            json_start = data_str.find("{")
-            if json_start > 0:
-                data_str = data_str[json_start:]
-
-            json_end = data_str.rfind("}")
-            if json_end > 0 and json_end < len(data_str) - 1:
-                data_str = data_str[:json_end + 1]
-            decode_ms = int((time.time() - decode_start) * 1000.0)
-
-            spool_id = self._extract_spool_id(data_str)
-            if spool_id:
-                if self._apply_spool_id(spool_id):
-                    result = ("spool_applied" if self.happyhare_enable
-                              else "spool_detected")
-                    message = ("Spool ID applied" if self.happyhare_enable
-                               else "Spool ID detected; dispatch disabled")
-                    self._set_scan_status(
-                        result,
-                        message,
-                        uid=uid_list,
-                        spool_id=spool_id,
-                        data_preview=data_preview,
-                        protocol=protocol)
-            else:
-                self.gcode.respond_info("No HappyHare spool ID found in tag data.")
-                self._set_scan_status(
-                    "no_spool_id",
-                    "No HappyHare spool ID found",
-                    uid=uid_list,
-                    data_preview=data_preview,
-                    protocol=protocol)
-
-            try:
-                data_json = json.loads(data_str)
-                formatted = json.dumps(data_json, indent=2, ensure_ascii=False)
-                self.gcode.respond_info("%s data (JSON):" % (protocol_label,))
-                for line in formatted.split("\n"):
-                    self.gcode.respond_info("  %s" % (line,))
-                self.gcode.respond_info("=" * 50)
-                self._debug_profile_line({
-                    "detect_ms": detect_ms,
-                    "read_ms": read_ms,
-                    "decode_ms": decode_ms,
-                    "total_ms": int((time.time() - scan_start) * 1000.0),
-                })
-                self._debug_scan_line()
-                return formatted
-            except json.JSONDecodeError:
-                cleaned = []
-                for ch in data_str:
-                    if (32 <= ord(ch) <= 126) or ch in ("\n", "\r"):
-                        cleaned.append(ch)
-                    else:
-                        cleaned.append("<0x%02X>" % (ord(ch),))
-                self.gcode.respond_info("Text data: %s" % ("".join(cleaned),))
-                self.gcode.respond_info("=" * 50)
-                self._debug_profile_line({
-                    "detect_ms": detect_ms,
-                    "read_ms": read_ms,
-                    "decode_ms": decode_ms,
-                    "total_ms": int((time.time() - scan_start) * 1000.0),
-                })
-                self._debug_scan_line()
-                return data_str
-        except Exception as e:
-            self.gcode.respond_info("Error reading PN5180 tag: %s" % (e,))
-            logging.exception("PN5180 read failed: %s", e)
-            self._set_scan_status("error", "Read failed", error=str(e))
-            self.handler.initialize(announce=False)
+                "no_tag", "No supported tag detected", protocol="",
+                add_event=report_no_tag)
+            if report_no_tag:
+                self.gcode.respond_info("PN5180 scan complete: no tag detected")
             self._debug_scan_line()
             return None
+
+        protocol = tag["protocol"]
+        protocol_label = self._protocol_label(protocol)
+        uid_list = tag["uid"]
+        uid_str = " ".join("%02X" % (b,) for b in uid_list)
+        self.gcode.respond_info("=" * 50)
+        self.gcode.respond_info("PN5180 %s detected" % (protocol_label,))
+        self.gcode.respond_info("Card UID: %s" % (uid_str,))
+        logging.info(
+            "PN5180 %s card detected UID=%s", protocol_label, uid_str)
+        self._set_scan_status(
+            "tag_detected", "%s detected" % (protocol_label,),
+            uid=uid_list, protocol=protocol)
+
+        read_start = time.time()
+        if protocol == "iso15693":
+            user_data = self.handler.iso15693_read_user_memory(
+                batch_size=self.iso15693_blocks_per_read)
+        else:
+            user_data = self.handler.ntag_read_user_memory()
+        read_ms = int((time.time() - read_start) * 1000.0)
+        if not user_data:
+            self.gcode.respond_info("No data on tag")
+            self._set_scan_status(
+                "empty_tag", "No data on tag", uid=uid_list,
+                protocol=protocol)
+            self._debug_scan_line()
+            return None
+
+        self.last_uid = uid_list
+        self.last_tag_protocol = protocol
+        self.waiting_for_removal = True
+        self.waiting_notice_sent = False
+
+        preview = " ".join("%02X" % (b,) for b in user_data[:32])
+        self.gcode.respond_info("Data preview: %s" % (preview,))
+
+        decode_start = time.time()
+        data_str = self._decode_tag_user_data(user_data)
+        data_preview = data_str[:120]
+        if not data_str:
+            self.gcode.respond_info("Tag is empty")
+            self._set_scan_status(
+                "empty_tag", "Tag is empty", uid=uid_list,
+                data_preview=data_preview, protocol=protocol)
+            self._debug_scan_line()
+            return None
+
+        json_start = data_str.find("{")
+        if json_start > 0:
+            data_str = data_str[json_start:]
+
+        json_end = data_str.rfind("}")
+        if json_end > 0 and json_end < len(data_str) - 1:
+            data_str = data_str[:json_end + 1]
+        decode_ms = int((time.time() - decode_start) * 1000.0)
+
+        spool_id = self._extract_spool_id(data_str)
+        if spool_id:
+            if self._apply_spool_id(spool_id):
+                result = ("spool_applied" if self.happyhare_enable
+                          else "spool_detected")
+                message = ("Spool ID applied" if self.happyhare_enable
+                           else "Spool ID detected; dispatch disabled")
+                self._set_scan_status(
+                    result,
+                    message,
+                    uid=uid_list,
+                    spool_id=spool_id,
+                    data_preview=data_preview,
+                    protocol=protocol)
+        else:
+            self.gcode.respond_info("No HappyHare spool ID found in tag data.")
+            self._set_scan_status(
+                "no_spool_id",
+                "No HappyHare spool ID found",
+                uid=uid_list,
+                data_preview=data_preview,
+                protocol=protocol)
+
+        try:
+            data_json = json.loads(data_str)
+            formatted = json.dumps(data_json, indent=2, ensure_ascii=False)
+            self.gcode.respond_info("%s data (JSON):" % (protocol_label,))
+            for line in formatted.split("\n"):
+                self.gcode.respond_info("  %s" % (line,))
+            self.gcode.respond_info("=" * 50)
+            self._debug_profile_line({
+                "detect_ms": detect_ms,
+                "read_ms": read_ms,
+                "decode_ms": decode_ms,
+                "total_ms": int((time.time() - scan_start) * 1000.0),
+            })
+            self._debug_scan_line()
+            return formatted
+        except json.JSONDecodeError:
+            cleaned = []
+            for ch in data_str:
+                if (32 <= ord(ch) <= 126) or ch in ("\n", "\r"):
+                    cleaned.append(ch)
+                else:
+                    cleaned.append("<0x%02X>" % (ord(ch),))
+            self.gcode.respond_info("Text data: %s" % ("".join(cleaned),))
+            self.gcode.respond_info("=" * 50)
+            self._debug_profile_line({
+                "detect_ms": detect_ms,
+                "read_ms": read_ms,
+                "decode_ms": decode_ms,
+                "total_ms": int((time.time() - scan_start) * 1000.0),
+            })
+            self._debug_scan_line()
+            return data_str
+
+    def rfid_read(self, report_no_tag=False, retries=3):
+        last_error = None
+        retries = max(1, int(retries))
+        for attempt in range(retries):
+            try:
+                return self._rfid_read_once(report_no_tag=report_no_tag)
+            except Exception as e:
+                last_error = e
+                logging.exception(
+                    "PN5180 read attempt %d/%d failed: %s",
+                    attempt + 1, retries, e)
+                if attempt + 1 < retries:
+                    self.gcode.respond_info(
+                        "PN5180 read failed; hardware reset and retry %d/%d." % (
+                            attempt + 2, retries))
+                    if not self.handler.initialize(announce=False):
+                        break
+                    continue
+                self.gcode.respond_info("Error reading PN5180 tag: %s" % (e,))
+                self._set_scan_status("error", "Read failed", error=str(e))
+                self.handler.initialize(announce=False)
+                self._debug_scan_line()
+                return None
+        if last_error is not None:
+            self.gcode.respond_info("Error reading PN5180 tag: %s" % (last_error,))
+            self._set_scan_status("error", "Read failed", error=str(last_error))
+            self._debug_scan_line()
+        return None
 
 
 class PN5180:
@@ -1416,9 +1351,11 @@ class PN5180:
         if self.manager is None:
             self.gcode.respond_info("PN5180 manager is not initialized")
             return
-        if not self.manager.handler.initialized:
-            if not self.manager.initialize():
-                return
+        if self.service and self.service.running:
+            self.gcode.respond_info("PN5180 read is already running.")
+            return
+        if not self.manager.initialize():
+            return
         if self.service is None:
             self._init_service()
         self.service.schedule(func=self.manager.rfid_read)
@@ -1459,9 +1396,6 @@ class PN5180:
                 "tag_protocol": "",
                 "debug_log": False,
                 "happyhare_enable": False,
-                "comm_check_interval": 0,
-                "consecutive_no_tag": 0,
-                "communication_lost": False,
                 "scan_count": 0,
                 "last_scan_result": "not_initialized",
                 "last_scan_message": "PN5180 manager is not initialized",
@@ -1514,10 +1448,6 @@ class PN5180:
             status["happyhare_enable"],))
         self.gcode.respond_info("PN5180 ISO15693 blocks per read: %d" % (
             status["iso15693_blocks_per_read"],))
-        self.gcode.respond_info("PN5180 communication lost: %s" % (
-            status["communication_lost"],))
-        self.gcode.respond_info("PN5180 consecutive no-tag scans: %d" % (
-            status["consecutive_no_tag"],))
         self.gcode.respond_info("PN5180 scan count: %d" % (
             status["scan_count"],))
         self.gcode.respond_info("PN5180 last result: %s - %s" % (
@@ -1582,8 +1512,6 @@ class PN5180:
             return
         ok = self.manager.initialize()
         if ok:
-            self.manager.communication_lost = False
-            self.manager.communication_lost_notice_sent = False
             self.gcode.respond_info("PN5180 hardware reset complete.")
         else:
             self.gcode.respond_info(
