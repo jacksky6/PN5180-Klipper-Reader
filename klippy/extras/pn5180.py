@@ -848,6 +848,8 @@ class PN5180Manager:
                 "or iso15693" % (config.get_name(),))
         self.debug_log = config.getboolean("debug_log", True)
         self.happyhare_enable = config.getboolean("happyhare_enable", True)
+        self.iso15693_blocks_per_read = config.getint(
+            "iso15693_blocks_per_read", 8, minval=1, maxval=16)
         self.comm_check_interval = config.getint(
             "comm_check_interval", 10, minval=0)
         self.last_uid = None
@@ -1001,6 +1003,7 @@ class PN5180Manager:
             "tag_protocol": self.tag_protocol,
             "debug_log": self.debug_log,
             "happyhare_enable": self.happyhare_enable,
+            "iso15693_blocks_per_read": self.iso15693_blocks_per_read,
             "comm_check_interval": self.comm_check_interval,
             "consecutive_no_tag": self.consecutive_no_tag,
             "communication_lost": self.communication_lost,
@@ -1202,7 +1205,9 @@ class PN5180Manager:
                 error=str(e))
             return False
 
-    def rfid_read(self, report_no_tag=False, iso15693_batch=1):
+    def rfid_read(self, report_no_tag=False, iso15693_blocks_per_read=None):
+        if iso15693_blocks_per_read is None:
+            iso15693_blocks_per_read = self.iso15693_blocks_per_read
         scan_start = time.time()
         self.scan_count += 1
         self._set_scan_status(
@@ -1290,7 +1295,7 @@ class PN5180Manager:
             read_start = time.time()
             if protocol == "iso15693":
                 user_data = self.handler.iso15693_read_user_memory(
-                    batch_size=iso15693_batch)
+                    batch_size=iso15693_blocks_per_read)
             else:
                 user_data = self.handler.ntag_read_user_memory()
             read_ms = int((time.time() - read_start) * 1000.0)
@@ -1428,7 +1433,7 @@ class PN5180:
     def _init_service(self):
         self.service = PN5180Service(self.printer.get_reactor(), self.scan_period)
 
-    def read_begin(self, iso15693_batch=1):
+    def read_begin(self, iso15693_blocks_per_read=None):
         if self.manager is None:
             self.gcode.respond_info("PN5180 manager is not initialized")
             return
@@ -1439,11 +1444,14 @@ class PN5180:
             self._init_service()
         self.service.schedule(
             func=self.manager.rfid_read,
-            params={"iso15693_batch": iso15693_batch})
+            params={"iso15693_blocks_per_read": iso15693_blocks_per_read})
         ret = self.service.start()
         if ret:
             self.gcode.respond_info(
-                "PN5180 read started. ISO15693 batch=%d" % (iso15693_batch,))
+                "PN5180 read started. ISO15693 blocks_per_read=%d" % (
+                    iso15693_blocks_per_read
+                    if iso15693_blocks_per_read is not None
+                    else self.manager.iso15693_blocks_per_read,))
         else:
             self.gcode.respond_info("PN5180 read is already running.")
 
@@ -1455,7 +1463,7 @@ class PN5180:
         self.gcode.respond_info(
             "PN5180 read stopped." if ret else "PN5180 read is not running.")
 
-    def scan_once(self, iso15693_batch=1):
+    def scan_once(self, iso15693_blocks_per_read=None):
         if self.manager is None:
             self.gcode.respond_info("PN5180 manager is not initialized")
             return
@@ -1463,7 +1471,8 @@ class PN5180:
             if not self.manager.initialize():
                 return
         self.manager.rfid_read(
-            report_no_tag=True, iso15693_batch=iso15693_batch)
+            report_no_tag=True,
+            iso15693_blocks_per_read=iso15693_blocks_per_read)
 
     def get_status(self, eventtime):
         status = {
@@ -1530,6 +1539,8 @@ class PN5180:
             status["debug_log"],))
         self.gcode.respond_info("PN5180 HappyHare dispatch: %s" % (
             status["happyhare_enable"],))
+        self.gcode.respond_info("PN5180 ISO15693 blocks per read: %d" % (
+            status["iso15693_blocks_per_read"],))
         self.gcode.respond_info("PN5180 communication lost: %s" % (
             status["communication_lost"],))
         self.gcode.respond_info("PN5180 consecutive no-tag scans: %d" % (
@@ -1623,7 +1634,8 @@ class PN5180:
         recover_flag = gcmd.get_int("RECOVER", 0)
         debug_flag = gcmd.get_int("DEBUG", None)
         happyhare_flag = gcmd.get_int("HAPPYHARE", None)
-        iso15693_batch = gcmd.get_int("ISO15693_BATCH", 1, minval=1, maxval=16)
+        iso15693_blocks_per_read = gcmd.get_int(
+            "ISO15693_BLOCKS_PER_READ", None, minval=1, maxval=16)
 
         if happyhare_flag is not None:
             self.manager.happyhare_enable = bool(happyhare_flag)
@@ -1634,11 +1646,13 @@ class PN5180:
             self.gcode.respond_info("PN5180 debug log: %s" % (
                 self.manager.debug_log,))
         elif read_flag == 1:
-            self.read_begin(iso15693_batch=iso15693_batch)
+            self.read_begin(
+                iso15693_blocks_per_read=iso15693_blocks_per_read)
         elif read_flag == 0:
             self.read_end()
         elif scan_flag == 1:
-            self.scan_once(iso15693_batch=iso15693_batch)
+            self.scan_once(
+                iso15693_blocks_per_read=iso15693_blocks_per_read)
         elif init_flag == 1:
             self.manager.initialize()
         elif status_flag == 1:
@@ -1658,7 +1672,7 @@ class PN5180:
             self.gcode.respond_info(
                 "  PN5180 NAME=%s SCAN=1   - read once" % (self.name,))
             self.gcode.respond_info(
-                "  PN5180 NAME=%s ISO15693_BATCH=4 SCAN=1   - debug ISO15693 batch read" % (
+                "  PN5180 NAME=%s ISO15693_BLOCKS_PER_READ=8 SCAN=1   - override ISO15693 blocks per read" % (
                     self.name,))
             self.gcode.respond_info(
                 "  PN5180 NAME=%s STATUS=1 - show status" % (self.name,))
