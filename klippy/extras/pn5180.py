@@ -61,6 +61,10 @@ ISO15693_FLAG_HIGH_DATA_RATE = 0x02
 ISO15693_FLAG_INVENTORY = 0x04
 ISO15693_FLAG_ONE_SLOT = 0x20
 
+DEFAULT_NTAG_START_PAGE = 4
+DEFAULT_NTAG_END_PAGE = 67
+DEFAULT_ISO15693_START_BLOCK = 0
+DEFAULT_ISO15693_END_BLOCK = 79
 RESET_SCHEDULE_DELAY = 0.100
 RESET_LOW_TIME = 0.100
 RESET_BOOT_DELAY = 0.200
@@ -553,10 +557,20 @@ class PN5180Handler:
                 "ISO15693 block %d error response 0x%02X" % (block, code))
         return data[1:]
 
-    def iso15693_read_user_memory(self, start_block=0, end_block=79):
+    def iso15693_read_user_memory(self, start_block=DEFAULT_ISO15693_START_BLOCK,
+                                  end_block=DEFAULT_ISO15693_END_BLOCK):
         user_data = bytearray()
         for block in range(start_block, end_block + 1):
-            user_data.extend(self.iso15693_read_single_block(block))
+            block_data = self.iso15693_read_single_block(block)
+            if not block_data:
+                break
+            user_data.extend(block_data)
+            expected_len = self._expected_tlv_total_length(user_data)
+            if expected_len and len(user_data) >= expected_len:
+                user_data = user_data[:expected_len]
+                break
+            if expected_len is None and self._is_empty_data(block_data):
+                break
         try:
             self.rf_off()
         except Exception:
@@ -598,17 +612,68 @@ class PN5180Handler:
                 time.sleep(0.01)
         raise PN5180Error("read page %d failed: %s" % (page, last_error))
 
-    def ntag_read_user_memory(self, start_page=4, end_page=67):
+    def ntag_read_user_memory(self, start_page=DEFAULT_NTAG_START_PAGE,
+                              end_page=DEFAULT_NTAG_END_PAGE):
         user_data = bytearray()
         page = start_page
         while page <= end_page:
             block = self.ntag_read_page(page)
             remaining_pages = end_page - page + 1
             copy_len = min(remaining_pages, 4) * 4
-            user_data.extend(block[:copy_len])
+            copied = block[:copy_len]
+            user_data.extend(copied)
+            expected_len = self._expected_tlv_total_length(user_data)
+            if expected_len and len(user_data) >= expected_len:
+                user_data = user_data[:expected_len]
+                break
+            if expected_len is None and self._is_empty_data(copied):
+                break
             page += 4
         self.mifare_halt()
         return user_data
+
+    @staticmethod
+    def _is_empty_data(data):
+        return bool(data) and all(b == 0x00 for b in data)
+
+    @staticmethod
+    def _expected_tlv_total_length(data):
+        data = bytes(data)
+        offsets = [0]
+        if len(data) >= 4 and data[0] in (0xE1, 0xE2):
+            offsets.insert(0, 4)
+        for offset in offsets:
+            total = PN5180Handler._expected_tlv_total_length_at(data, offset)
+            if total is not None:
+                return total
+        return None
+
+    @staticmethod
+    def _expected_tlv_total_length_at(data, offset):
+        pos = offset
+        while pos < len(data):
+            tlv_type = data[pos]
+            pos += 1
+            if tlv_type == 0x00:
+                continue
+            if tlv_type == 0xFE:
+                return pos
+            if pos >= len(data):
+                return None
+            tlv_len = data[pos]
+            pos += 1
+            if tlv_len == 0xFF:
+                if pos + 2 > len(data):
+                    return None
+                tlv_len = (data[pos] << 8) | data[pos + 1]
+                pos += 2
+            total = pos + tlv_len
+            if tlv_type == 0x03:
+                if total < len(data) and data[total] == 0xFE:
+                    total += 1
+                return total
+            pos = total
+        return None
 
 
 class PN5180Service:
@@ -674,21 +739,11 @@ class PN5180Manager:
         self.reactor = printer.get_reactor()
         self.gcode = printer.lookup_object("gcode")
         self.handler = PN5180Handler(printer, spi, config)
-        self.start_page = config.getint("start_page", 4, minval=0)
-        self.end_page = config.getint("end_page", 67, minval=0)
         self.tag_protocol = config.get("tag_protocol", "auto").lower()
         if self.tag_protocol not in ("auto", "ntag", "iso15693"):
             raise config.error(
                 "Option 'tag_protocol' in section '%s' must be auto, ntag, "
                 "or iso15693" % (config.get_name(),))
-        self.iso15693_start_block = config.getint(
-            "iso15693_start_block", 0, minval=0, maxval=255)
-        self.iso15693_end_block = config.getint(
-            "iso15693_end_block", 79, minval=0, maxval=255)
-        if self.iso15693_end_block < self.iso15693_start_block:
-            raise config.error(
-                "Option 'iso15693_end_block' in section '%s' must be greater "
-                "than or equal to iso15693_start_block" % (config.get_name(),))
         self.debug_log = config.getboolean("debug_log", True)
         self.happyhare_enable = config.getboolean("happyhare_enable", True)
         self.comm_check_interval = config.getint(
@@ -822,8 +877,6 @@ class PN5180Manager:
     def get_status(self):
         return {
             "tag_protocol": self.tag_protocol,
-            "iso15693_start_block": self.iso15693_start_block,
-            "iso15693_end_block": self.iso15693_end_block,
             "debug_log": self.debug_log,
             "happyhare_enable": self.happyhare_enable,
             "comm_check_interval": self.comm_check_interval,
@@ -933,7 +986,21 @@ class PN5180Manager:
 
     def _decode_tag_user_data(self, user_data):
         data = bytes(user_data)
-        pos = 0
+        offsets = [0]
+        if len(data) >= 4 and data[0] in (0xE1, 0xE2):
+            offsets.insert(0, 4)
+        for offset in offsets:
+            text = self._decode_tlv_data(data, offset)
+            if text:
+                return text
+
+        terminator = data.find(b"\xFE")
+        if terminator >= 0:
+            data = data[:terminator]
+        return data.decode("utf-8", errors="ignore").rstrip("\x00").strip()
+
+    def _decode_tlv_data(self, data, offset=0):
+        pos = offset
         while pos < len(data):
             tlv_type = data[pos]
             pos += 1
@@ -957,11 +1024,7 @@ class PN5180Manager:
                 if text:
                     return text
                 return value.decode("utf-8", errors="ignore").strip()
-
-        terminator = data.find(b"\xFE")
-        if terminator >= 0:
-            data = data[:terminator]
-        return data.decode("utf-8", errors="ignore").rstrip("\x00").strip()
+        return None
 
     def _decode_ntag_user_data(self, user_data):
         return self._decode_tag_user_data(user_data)
@@ -1100,12 +1163,9 @@ class PN5180Manager:
                 uid=uid_list, protocol=protocol)
 
             if protocol == "iso15693":
-                user_data = self.handler.iso15693_read_user_memory(
-                    start_block=self.iso15693_start_block,
-                    end_block=self.iso15693_end_block)
+                user_data = self.handler.iso15693_read_user_memory()
             else:
-                user_data = self.handler.ntag_read_user_memory(
-                    start_page=self.start_page, end_page=self.end_page)
+                user_data = self.handler.ntag_read_user_memory()
             if not user_data:
                 self.gcode.respond_info("No data on tag")
                 self._set_scan_status(
@@ -1267,8 +1327,6 @@ class PN5180:
             status.update({
                 "initialized": False,
                 "tag_protocol": "",
-                "iso15693_start_block": 0,
-                "iso15693_end_block": 0,
                 "debug_log": False,
                 "happyhare_enable": False,
                 "comm_check_interval": 0,
