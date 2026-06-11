@@ -1,7 +1,7 @@
 # PN5180 NFC reader support for Klipper.
 #
-# First target: ISO14443A / NTAG read over SPI. The driver uses fixed
-# command delays like pypn5180.
+# Supports ISO14443A / NTAG and ISO15693 tags over SPI. The driver uses
+# fixed command delays like pypn5180.
 # Place this module in klippy/extras/ and configure it with a [pn5180 <name>]
 # section.
 
@@ -54,6 +54,12 @@ TRANSCEIVE_STATE_WAIT_TRANSMIT = 1
 TRANSCEIVE_STATE_IDLE = 0
 
 MIFARE_CMD_READ = 0x30
+
+ISO15693_CMD_INVENTORY = 0x01
+ISO15693_CMD_READ_SINGLE_BLOCK = 0x20
+ISO15693_FLAG_HIGH_DATA_RATE = 0x02
+ISO15693_FLAG_INVENTORY = 0x04
+ISO15693_FLAG_ONE_SLOT = 0x20
 
 RESET_SCHEDULE_DELAY = 0.100
 RESET_LOW_TIME = 0.100
@@ -252,6 +258,18 @@ class PN5180Handler:
         self._wait_transceive_state(TRANSCEIVE_STATE_IDLE, timeout=0.05)
         self.clear_irq_status(0xFFFFFFFF)
         self.load_rf_config(0x00, 0x80)
+        self.rf_on()
+        self.write_register_or_mask(SYSTEM_CONFIG, 0x00000003)
+
+    def setup_iso15693_rf(self):
+        try:
+            self.rf_off()
+        except Exception:
+            pass
+        self.write_register_and_mask(SYSTEM_CONFIG, 0xFFFFFFF8)
+        self._wait_transceive_state(TRANSCEIVE_STATE_IDLE, timeout=0.05)
+        self.clear_irq_status(0xFFFFFFFF)
+        self.load_rf_config(0x0D, 0x8D)
         self.rf_on()
         self.write_register_or_mask(SYSTEM_CONFIG, 0x00000003)
 
@@ -469,6 +487,82 @@ class PN5180Handler:
             self.current_uid_hex = ""
             return False, None
 
+    def iso15693_inventory(self):
+        self.setup_iso15693_rf()
+        flags = (ISO15693_FLAG_HIGH_DATA_RATE | ISO15693_FLAG_INVENTORY
+                 | ISO15693_FLAG_ONE_SLOT)
+        self.send_data([flags, ISO15693_CMD_INVENTORY, 0x00], valid_bits=0x00)
+        if not self._wait_irq(RX_IRQ_STAT, timeout=self.rf_timeout,
+                              raise_on_error=False):
+            logging.debug("PN5180 no ISO15693 inventory response")
+            return None
+        rx_len = self.rx_bytes_received()
+        if rx_len < 10 or rx_len == RX_BYTES_RECEIVED_MASK:
+            logging.debug("PN5180 invalid ISO15693 inventory length %d", rx_len)
+            return None
+        data = self.read_data(rx_len)
+        if len(data) < 10 or data[0] & 0x01:
+            logging.debug("PN5180 invalid ISO15693 inventory data: %s", data)
+            return None
+        uid_lsb_first = data[2:10]
+        uid = list(reversed(uid_lsb_first))
+        self.current_uid = uid
+        self.current_uid_hex = " ".join("%02X" % (b,) for b in uid)
+        return {
+            "uid": uid,
+            "uid_length": len(uid),
+            "dsfid": data[1],
+        }
+
+    def read_iso15693_target_id(self):
+        if not self.initialized:
+            return False, None
+        try:
+            tag = self.iso15693_inventory()
+            if not tag:
+                self.current_uid = None
+                self.current_uid_hex = ""
+                return False, None
+            return True, tag["uid"]
+        except Exception as e:
+            logging.debug("PN5180 ISO15693 detection failed: %s", e)
+            self.software_recover()
+            self.current_uid = None
+            self.current_uid_hex = ""
+            return False, None
+
+    def iso15693_read_single_block(self, block):
+        self.send_data([
+            ISO15693_FLAG_HIGH_DATA_RATE,
+            ISO15693_CMD_READ_SINGLE_BLOCK,
+            block & 0xFF,
+        ], valid_bits=0x00)
+        if not self._wait_irq(RX_IRQ_STAT, timeout=self.rf_timeout,
+                              raise_on_error=False):
+            raise PN5180Error("timeout waiting ISO15693 block %d" % (block,))
+        rx_len = self.rx_bytes_received()
+        if rx_len in (0, RX_BYTES_RECEIVED_MASK):
+            raise PN5180Error(
+                "invalid ISO15693 RX_STATUS length %d" % (rx_len,))
+        data = self.read_data(rx_len)
+        if not data:
+            raise PN5180Error("short ISO15693 block response")
+        if data[0] & 0x01:
+            code = data[1] if len(data) > 1 else 0
+            raise PN5180Error(
+                "ISO15693 block %d error response 0x%02X" % (block, code))
+        return data[1:]
+
+    def iso15693_read_user_memory(self, start_block=0, end_block=79):
+        user_data = bytearray()
+        for block in range(start_block, end_block + 1):
+            user_data.extend(self.iso15693_read_single_block(block))
+        try:
+            self.rf_off()
+        except Exception:
+            pass
+        return user_data
+
     def ntag_read_page(self, page):
         last_error = None
         for attempt in range(self.page_read_retries):
@@ -582,11 +676,25 @@ class PN5180Manager:
         self.handler = PN5180Handler(printer, spi, config)
         self.start_page = config.getint("start_page", 4, minval=0)
         self.end_page = config.getint("end_page", 67, minval=0)
+        self.tag_protocol = config.get("tag_protocol", "auto").lower()
+        if self.tag_protocol not in ("auto", "ntag", "iso15693"):
+            raise config.error(
+                "Option 'tag_protocol' in section '%s' must be auto, ntag, "
+                "or iso15693" % (config.get_name(),))
+        self.iso15693_start_block = config.getint(
+            "iso15693_start_block", 0, minval=0, maxval=255)
+        self.iso15693_end_block = config.getint(
+            "iso15693_end_block", 79, minval=0, maxval=255)
+        if self.iso15693_end_block < self.iso15693_start_block:
+            raise config.error(
+                "Option 'iso15693_end_block' in section '%s' must be greater "
+                "than or equal to iso15693_start_block" % (config.get_name(),))
         self.debug_log = config.getboolean("debug_log", True)
         self.happyhare_enable = config.getboolean("happyhare_enable", True)
         self.comm_check_interval = config.getint(
             "comm_check_interval", 10, minval=0)
         self.last_uid = None
+        self.last_tag_protocol = ""
         self.waiting_for_removal = False
         self.waiting_notice_sent = False
         self.consecutive_no_tag = 0
@@ -597,6 +705,7 @@ class PN5180Manager:
         self.last_scan_result = "idle"
         self.last_scan_message = ""
         self.last_error = ""
+        self.last_protocol = ""
         self.last_uid_hex = ""
         self.last_spool_id = ""
         self.last_data_preview = ""
@@ -611,11 +720,13 @@ class PN5180Manager:
     def _uid_hex(self, uid):
         return " ".join("%02X" % (b,) for b in uid)
 
-    def _add_event(self, result, message="", uid=None, spool_id=""):
+    def _add_event(self, result, message="", uid=None, spool_id="",
+                   protocol=""):
         event = {
             "time": self._now(),
             "result": result,
             "message": message,
+            "protocol": protocol or "",
             "uid": self._uid_hex(uid) if uid else "",
             "spool_id": spool_id or "",
         }
@@ -623,11 +734,14 @@ class PN5180Manager:
         self.recent_events = self.recent_events[-12:]
 
     def _set_scan_status(self, result, message="", uid=None, spool_id="",
-                         error="", data_preview=None, add_event=True):
+                         error="", data_preview=None, protocol=None,
+                         add_event=True):
         self.last_scan_time = self._now()
         self.last_scan_result = result
         self.last_scan_message = message
         self.last_error = error or ""
+        if protocol is not None:
+            self.last_protocol = protocol
         if uid is not None:
             self.last_uid_hex = self._uid_hex(uid)
         if spool_id:
@@ -635,7 +749,9 @@ class PN5180Manager:
         if data_preview is not None:
             self.last_data_preview = data_preview
         if add_event:
-            self._add_event(result, message, uid=uid, spool_id=spool_id)
+            self._add_event(
+                result, message, uid=uid, spool_id=spool_id,
+                protocol=self.last_protocol)
 
     def _debug_scan_line(self):
         if not self.debug_log:
@@ -646,6 +762,8 @@ class PN5180Manager:
         ]
         if self.last_scan_message:
             parts.append(self.last_scan_message)
+        if self.last_protocol:
+            parts.append("protocol=%s" % (self.last_protocol,))
         if self.last_uid_hex:
             parts.append("uid=%s" % (self.last_uid_hex,))
         if self.last_spool_id:
@@ -703,6 +821,9 @@ class PN5180Manager:
 
     def get_status(self):
         return {
+            "tag_protocol": self.tag_protocol,
+            "iso15693_start_block": self.iso15693_start_block,
+            "iso15693_end_block": self.iso15693_end_block,
             "debug_log": self.debug_log,
             "happyhare_enable": self.happyhare_enable,
             "comm_check_interval": self.comm_check_interval,
@@ -713,12 +834,43 @@ class PN5180Manager:
             "last_scan_result": self.last_scan_result,
             "last_scan_message": self.last_scan_message,
             "last_error": self.last_error,
+            "last_protocol": self.last_protocol,
             "last_uid": self.last_uid_hex,
             "last_spool_id": self.last_spool_id,
             "last_data_preview": self.last_data_preview,
             "waiting_for_removal": self.waiting_for_removal,
             "recent_events": list(self.recent_events),
         }
+
+    def _protocols_to_try(self):
+        if self.tag_protocol == "ntag":
+            return ["ntag"]
+        if self.tag_protocol == "iso15693":
+            return ["iso15693"]
+        return ["ntag", "iso15693"]
+
+    def _protocol_label(self, protocol):
+        if protocol == "iso15693":
+            return "ISO15693"
+        return "NTAG"
+
+    def _scan_message(self):
+        if self.tag_protocol == "auto":
+            return "Scanning for NTAG/ISO15693"
+        return "Scanning for %s" % (self._protocol_label(self.tag_protocol),)
+
+    def _detect_tag(self):
+        for protocol in self._protocols_to_try():
+            if protocol == "ntag":
+                success, uid = self.handler.read_passive_target_id(timeout=0.5)
+            else:
+                success, uid = self.handler.read_iso15693_target_id()
+            if success and uid:
+                return {
+                    "protocol": protocol,
+                    "uid": list(uid),
+                }
+        return None
 
     def _search_spool_id_in_obj(self, obj):
         if isinstance(obj, dict):
@@ -779,7 +931,7 @@ class PN5180Manager:
                 break
         return None
 
-    def _decode_ntag_user_data(self, user_data):
+    def _decode_tag_user_data(self, user_data):
         data = bytes(user_data)
         pos = 0
         while pos < len(data):
@@ -810,6 +962,9 @@ class PN5180Manager:
         if terminator >= 0:
             data = data[:terminator]
         return data.decode("utf-8", errors="ignore").rstrip("\x00").strip()
+
+    def _decode_ntag_user_data(self, user_data):
+        return self._decode_tag_user_data(user_data)
 
     def _extract_spool_id(self, data_str):
         if not data_str:
@@ -864,7 +1019,8 @@ class PN5180Manager:
 
     def rfid_read(self, report_no_tag=False):
         self.scan_count += 1
-        self._set_scan_status("scanning", "Scanning for NTAG", add_event=False)
+        self._set_scan_status(
+            "scanning", self._scan_message(), protocol="", add_event=False)
         try:
             if self.communication_lost and self.handler.reset_pin is None:
                 self._set_scan_status(
@@ -874,15 +1030,18 @@ class PN5180Manager:
                 return None
 
             if self.waiting_for_removal:
-                success, uid = self.handler.read_passive_target_id(timeout=0.5)
-                if success and uid:
+                tag = self._detect_tag()
+                if tag:
                     self.consecutive_no_tag = 0
-                    uid_list = list(uid)
-                    if self.last_uid and uid_list == self.last_uid:
+                    uid_list = tag["uid"]
+                    protocol = tag["protocol"]
+                    if (self.last_uid and uid_list == self.last_uid
+                            and protocol == self.last_tag_protocol):
                         self._set_scan_status(
                             "waiting_removal",
                             "Tag already processed; waiting for removal",
                             uid=uid_list,
+                            protocol=protocol,
                             add_event=False)
                         if not self.waiting_notice_sent:
                             self.gcode.respond_info(
@@ -894,24 +1053,28 @@ class PN5180Manager:
                     self.waiting_for_removal = False
                     self.waiting_notice_sent = False
                     self.last_uid = None
+                    self.last_tag_protocol = ""
                 else:
                     self.consecutive_no_tag += 1
                     if self.waiting_notice_sent:
                         self.gcode.respond_info("Tag removed. Reader is ready.")
                     self._set_scan_status(
-                        "tag_removed", "Tag removed; reader ready")
+                        "tag_removed", "Tag removed; reader ready",
+                        protocol="")
                     self.waiting_for_removal = False
                     self.waiting_notice_sent = False
                     self.last_uid = None
+                    self.last_tag_protocol = ""
                     self._communication_watchdog()
                     self._debug_scan_line()
                     return None
 
-            success, uid = self.handler.read_passive_target_id(timeout=0.5)
-            if not success or not uid:
+            tag = self._detect_tag()
+            if not tag:
                 self.consecutive_no_tag += 1
                 self._set_scan_status(
-                    "no_tag", "No NTAG detected", add_event=report_no_tag)
+                    "no_tag", "No supported tag detected", protocol="",
+                    add_event=report_no_tag)
                 if not self._communication_watchdog():
                     self._debug_scan_line()
                     return None
@@ -923,36 +1086,49 @@ class PN5180Manager:
             self.consecutive_no_tag = 0
             self.communication_lost = False
             self.communication_lost_notice_sent = False
-            uid_list = list(uid)
+            protocol = tag["protocol"]
+            protocol_label = self._protocol_label(protocol)
+            uid_list = tag["uid"]
             uid_str = " ".join("%02X" % (b,) for b in uid_list)
             self.gcode.respond_info("=" * 50)
-            self.gcode.respond_info("PN5180 NTAG detected")
+            self.gcode.respond_info("PN5180 %s detected" % (protocol_label,))
             self.gcode.respond_info("Card UID: %s" % (uid_str,))
-            logging.info("PN5180 card detected UID=%s", uid_str)
-            self._set_scan_status("tag_detected", "NTAG detected", uid=uid_list)
+            logging.info(
+                "PN5180 %s card detected UID=%s", protocol_label, uid_str)
+            self._set_scan_status(
+                "tag_detected", "%s detected" % (protocol_label,),
+                uid=uid_list, protocol=protocol)
 
-            user_data = self.handler.ntag_read_user_memory(
-                start_page=self.start_page, end_page=self.end_page)
+            if protocol == "iso15693":
+                user_data = self.handler.iso15693_read_user_memory(
+                    start_block=self.iso15693_start_block,
+                    end_block=self.iso15693_end_block)
+            else:
+                user_data = self.handler.ntag_read_user_memory(
+                    start_page=self.start_page, end_page=self.end_page)
             if not user_data:
                 self.gcode.respond_info("No data on tag")
-                self._set_scan_status("empty_tag", "No data on tag", uid=uid_list)
+                self._set_scan_status(
+                    "empty_tag", "No data on tag", uid=uid_list,
+                    protocol=protocol)
                 self._debug_scan_line()
                 return None
 
             self.last_uid = uid_list
+            self.last_tag_protocol = protocol
             self.waiting_for_removal = True
             self.waiting_notice_sent = False
 
             preview = " ".join("%02X" % (b,) for b in user_data[:32])
             self.gcode.respond_info("Data preview: %s" % (preview,))
 
-            data_str = self._decode_ntag_user_data(user_data)
+            data_str = self._decode_tag_user_data(user_data)
             data_preview = data_str[:120]
             if not data_str:
                 self.gcode.respond_info("Tag is empty")
                 self._set_scan_status(
                     "empty_tag", "Tag is empty", uid=uid_list,
-                    data_preview=data_preview)
+                    data_preview=data_preview, protocol=protocol)
                 self._debug_scan_line()
                 return None
 
@@ -976,19 +1152,21 @@ class PN5180Manager:
                         message,
                         uid=uid_list,
                         spool_id=spool_id,
-                        data_preview=data_preview)
+                        data_preview=data_preview,
+                        protocol=protocol)
             else:
                 self.gcode.respond_info("No HappyHare spool ID found in tag data.")
                 self._set_scan_status(
                     "no_spool_id",
                     "No HappyHare spool ID found",
                     uid=uid_list,
-                    data_preview=data_preview)
+                    data_preview=data_preview,
+                    protocol=protocol)
 
             try:
                 data_json = json.loads(data_str)
                 formatted = json.dumps(data_json, indent=2, ensure_ascii=False)
-                self.gcode.respond_info("NTAG data (JSON):")
+                self.gcode.respond_info("%s data (JSON):" % (protocol_label,))
                 for line in formatted.split("\n"):
                     self.gcode.respond_info("  %s" % (line,))
                 self.gcode.respond_info("=" * 50)
@@ -1088,6 +1266,9 @@ class PN5180:
         if self.manager is None:
             status.update({
                 "initialized": False,
+                "tag_protocol": "",
+                "iso15693_start_block": 0,
+                "iso15693_end_block": 0,
                 "debug_log": False,
                 "happyhare_enable": False,
                 "comm_check_interval": 0,
@@ -1097,6 +1278,7 @@ class PN5180:
                 "last_scan_result": "not_initialized",
                 "last_scan_message": "PN5180 manager is not initialized",
                 "last_error": "",
+                "last_protocol": "",
                 "last_uid": "",
                 "last_spool_id": "",
                 "last_data_preview": "",
@@ -1136,6 +1318,8 @@ class PN5180:
         status = self.manager.get_status()
         self.gcode.respond_info("PN5180 reading: %s" % (
             bool(self.service and self.service.running),))
+        self.gcode.respond_info("PN5180 tag protocol: %s" % (
+            status["tag_protocol"],))
         self.gcode.respond_info("PN5180 debug log: %s" % (
             status["debug_log"],))
         self.gcode.respond_info("PN5180 HappyHare dispatch: %s" % (
@@ -1148,6 +1332,9 @@ class PN5180:
             status["scan_count"],))
         self.gcode.respond_info("PN5180 last result: %s - %s" % (
             status["last_scan_result"], status["last_scan_message"]))
+        if status["last_protocol"]:
+            self.gcode.respond_info("PN5180 last protocol: %s" % (
+                status["last_protocol"],))
         if status["last_uid"]:
             self.gcode.respond_info("PN5180 last UID: %s" % (status["last_uid"],))
         if status["last_spool_id"]:
@@ -1160,6 +1347,8 @@ class PN5180:
             self.gcode.respond_info("PN5180 recent events:")
             for event in status["recent_events"][-5:]:
                 detail = event["result"]
+                if event.get("protocol"):
+                    detail += " protocol=%s" % (event["protocol"],)
                 if event["uid"]:
                     detail += " uid=%s" % (event["uid"],)
                 if event["spool_id"]:
