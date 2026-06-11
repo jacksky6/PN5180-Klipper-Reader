@@ -1405,6 +1405,7 @@ class PN5180:
         self.name = config.get_name().split()[1]
         self.gcode = self.printer.lookup_object("gcode")
         self.scan_period = config.getfloat("scan_period", 3.0, above=0.0)
+        self.read_on_start = config.getboolean("read_on_start", False)
         self.config = config
 
         self.spi = bus.MCU_SPI_from_config(
@@ -1427,18 +1428,22 @@ class PN5180:
         reactor.register_timer(self._delayed_init, reactor.monotonic() + 1.0)
 
     def _delayed_init(self, eventtime):
-        self.manager.initialize()
+        if self.read_on_start:
+            self.read_begin(auto=True)
+        else:
+            self.manager.initialize()
         return self.printer.get_reactor().NEVER
 
     def _init_service(self):
         self.service = PN5180Service(self.printer.get_reactor(), self.scan_period)
 
-    def read_begin(self):
+    def read_begin(self, auto=False):
         if self.manager is None:
             self.gcode.respond_info("PN5180 manager is not initialized")
             return
         if self.service and self.service.running:
-            self.gcode.respond_info("PN5180 read is already running.")
+            if not auto:
+                self.gcode.respond_info("PN5180 read is already running.")
             return
         if not self.manager.initialize():
             return
@@ -1447,11 +1452,12 @@ class PN5180:
         self.service.schedule(func=self.manager.rfid_read)
         ret = self.service.start()
         if ret:
+            prefix = "PN5180 auto read started" if auto else "PN5180 read started"
             self.gcode.respond_info(
-                "PN5180 read started. tag_format=%s" % (
-                    self.manager.tag_format,))
+                "%s. tag_format=%s" % (prefix, self.manager.tag_format))
         else:
-            self.gcode.respond_info("PN5180 read is already running.")
+            if not auto:
+                self.gcode.respond_info("PN5180 read is already running.")
 
     def read_end(self):
         if self.service is None:
@@ -1475,6 +1481,7 @@ class PN5180:
             "name": self.name,
             "reading": bool(self.service and self.service.running),
             "scan_period": self.scan_period,
+            "read_on_start": self.read_on_start,
         }
         if self.manager is None:
             status.update({
