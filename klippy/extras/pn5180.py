@@ -1417,66 +1417,6 @@ class PN5180:
         })
         return status
 
-    def show_status(self):
-        if self.manager is None:
-            self.gcode.respond_info("PN5180 manager is not initialized")
-            return
-        handler = self.manager.handler
-        self.gcode.respond_info("PN5180 initialized: %s" % (handler.initialized,))
-        if handler.product_version:
-            self.gcode.respond_info("PN5180 product raw: %s" % (
-                handler._format_bytes(handler.product_version),))
-        if handler.firmware:
-            self.gcode.respond_info(
-                "PN5180 firmware: v%d.%d" % (
-                    handler.firmware[1], handler.firmware[0]))
-            self.gcode.respond_info("PN5180 firmware raw: %s" % (
-                handler._format_bytes(handler.firmware),))
-        if handler.eeprom_version:
-            self.gcode.respond_info("PN5180 EEPROM raw: %s" % (
-                handler._format_bytes(handler.eeprom_version),))
-        if handler.current_uid_hex:
-            self.gcode.respond_info("Last UID: %s" % (handler.current_uid_hex,))
-        status = self.manager.get_status()
-        self.gcode.respond_info("PN5180 reading: %s" % (
-            bool(self.service and self.service.running),))
-        self.gcode.respond_info("PN5180 tag protocol: %s" % (
-            status["tag_protocol"],))
-        self.gcode.respond_info("PN5180 debug log: %s" % (
-            status["debug_log"],))
-        self.gcode.respond_info("PN5180 HappyHare dispatch: %s" % (
-            status["happyhare_enable"],))
-        self.gcode.respond_info("PN5180 ISO15693 blocks per read: %d" % (
-            status["iso15693_blocks_per_read"],))
-        self.gcode.respond_info("PN5180 scan count: %d" % (
-            status["scan_count"],))
-        self.gcode.respond_info("PN5180 last result: %s - %s" % (
-            status["last_scan_result"], status["last_scan_message"]))
-        if status["last_protocol"]:
-            self.gcode.respond_info("PN5180 last protocol: %s" % (
-                status["last_protocol"],))
-        if status["last_uid"]:
-            self.gcode.respond_info("PN5180 last UID: %s" % (status["last_uid"],))
-        if status["last_spool_id"]:
-            self.gcode.respond_info("PN5180 last spool ID: %s" % (
-                status["last_spool_id"],))
-        if status["last_error"]:
-            self.gcode.respond_info("PN5180 last error: %s" % (
-                status["last_error"],))
-        if status["recent_events"]:
-            self.gcode.respond_info("PN5180 recent events:")
-            for event in status["recent_events"][-5:]:
-                detail = event["result"]
-                if event.get("protocol"):
-                    detail += " protocol=%s" % (event["protocol"],)
-                if event["uid"]:
-                    detail += " uid=%s" % (event["uid"],)
-                if event["spool_id"]:
-                    detail += " spool_id=%s" % (event["spool_id"],)
-                if event["message"]:
-                    detail += " - %s" % (event["message"],)
-                self.gcode.respond_info("  %s" % (detail,))
-
     def run_diag(self):
         if self.manager is None:
             self.gcode.respond_info("PN5180 manager is not initialized")
@@ -1521,7 +1461,6 @@ class PN5180:
         read_flag = gcmd.get_int("READ", None)
         scan_flag = gcmd.get_int("SCAN", 0)
         init_flag = gcmd.get_int("INIT", 0)
-        status_flag = gcmd.get_int("STATUS", 0)
         diag_flag = gcmd.get_int("DIAG", 0)
         recover_flag = gcmd.get_int("RECOVER", 0)
 
@@ -1533,8 +1472,6 @@ class PN5180:
             self.scan_once()
         elif init_flag == 1:
             self.manager.initialize()
-        elif status_flag == 1:
-            self.show_status()
         elif diag_flag == 1:
             self.run_diag()
         elif recover_flag == 1:
@@ -1549,8 +1486,6 @@ class PN5180:
                     self.name,))
             self.gcode.respond_info(
                 "  PN5180 NAME=%s SCAN=1   - read once" % (self.name,))
-            self.gcode.respond_info(
-                "  PN5180 NAME=%s STATUS=1 - show status" % (self.name,))
             self.gcode.respond_info(
                 "  PN5180 NAME=%s DIAG=1   - read diagnostic registers" % (
                     self.name,))
