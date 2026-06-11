@@ -76,6 +76,10 @@ class PN5180Error(Exception):
     pass
 
 
+class PN5180CommunicationError(PN5180Error):
+    pass
+
+
 class PN5180Handler:
     def __init__(self, printer, spi, config):
         self.printer = printer
@@ -292,6 +296,52 @@ class PN5180Handler:
             raise PN5180Error(
                 "all diagnostic registers read 0x00000000; check SPI MISO/CS/bus/power")
         return product, firmware, eeprom, registers
+
+    @staticmethod
+    def _invalid_register_values(values):
+        return (all(value == 0xFFFFFFFF for value in values)
+                or all(value == 0x00000000 for value in values))
+
+    def communication_lost(self):
+        try:
+            registers = {
+                "SYSTEM_CONFIG": self.read_register(SYSTEM_CONFIG),
+                "IRQ_STATUS": self.read_register(IRQ_STATUS),
+            }
+        except Exception as e:
+            return True, "health register read failed: %s" % (e,)
+
+        values = list(registers.values())
+        reg_summary = "SYSTEM_CONFIG=0x%08X IRQ_STATUS=0x%08X" % (
+            registers["SYSTEM_CONFIG"], registers["IRQ_STATUS"])
+        if not self._invalid_register_values(values):
+            return False, reg_summary
+
+        try:
+            product = self.read_eeprom(PRODUCT_VERSION, 2)
+            firmware = self.read_eeprom(FIRMWARE_VERSION, 2)
+            eeprom = self.read_eeprom(EEPROM_VERSION, 2)
+        except Exception as e:
+            return True, "%s; EEPROM read failed: %s" % (reg_summary, e)
+
+        eeprom_summary = "product=%s firmware=%s eeprom=%s" % (
+            self._format_bytes(product),
+            self._format_bytes(firmware),
+            self._format_bytes(eeprom))
+        if (self._is_suspicious_bytes(product)
+                or self._is_suspicious_bytes(firmware)
+                or self._is_suspicious_bytes(eeprom)):
+            return True, "%s; %s" % (reg_summary, eeprom_summary)
+        return False, "%s suspicious but EEPROM valid: %s" % (
+            reg_summary, eeprom_summary)
+
+    def recover_rf_state(self):
+        try:
+            self.rf_off()
+        except Exception:
+            pass
+        self.write_register_and_mask(SYSTEM_CONFIG, 0xFFFFFFF8)
+        self.clear_irq_status(0xFFFFFFFF)
 
     def initialize(self, announce=True):
         try:
@@ -964,6 +1014,20 @@ class PN5180Manager:
                 }
         return None
 
+    def _communication_lost(self):
+        lost, detail = self.handler.communication_lost()
+        if lost:
+            logging.warning("PN5180 communication lost: %s", detail)
+        else:
+            logging.debug("PN5180 communication health OK: %s", detail)
+        return lost, detail
+
+    def _recover_after_read_error(self):
+        try:
+            self.handler.recover_rf_state()
+        except Exception as e:
+            logging.debug("PN5180 RF state recovery failed: %s", e)
+
     def _search_spool_id_in_obj(self, obj):
         if isinstance(obj, dict):
             for key, value in obj.items():
@@ -1165,6 +1229,10 @@ class PN5180Manager:
         tag = self._detect_tag()
         detect_ms = int((time.time() - detect_start) * 1000.0)
         if not tag:
+            lost, detail = self._communication_lost()
+            if lost:
+                raise PN5180CommunicationError(
+                    "PN5180 did not return valid SPI data: %s" % (detail,))
             self._set_scan_status(
                 "no_tag", "No supported tag detected", protocol="",
                 add_event=report_no_tag)
@@ -1297,15 +1365,31 @@ class PN5180Manager:
                     "PN5180 read attempt %d/%d failed: %s",
                     attempt + 1, retries, e)
                 if attempt + 1 < retries:
-                    self.gcode.respond_info(
-                        "PN5180 read failed; hardware reset and retry %d/%d." % (
-                            attempt + 2, retries))
-                    if not self.handler.initialize(announce=False):
-                        break
+                    comm_lost = isinstance(e, PN5180CommunicationError)
+                    detail = str(e)
+                    if not comm_lost:
+                        comm_lost, detail = self._communication_lost()
+                    if comm_lost:
+                        self.gcode.respond_info(
+                            "PN5180 communication lost; hardware reset and retry %d/%d." % (
+                                attempt + 2, retries))
+                        if not self.handler.initialize(announce=False):
+                            break
+                    else:
+                        self.gcode.respond_info(
+                            "PN5180 read failed; RF reset and retry %d/%d." % (
+                                attempt + 2, retries))
+                        self._recover_after_read_error()
                     continue
                 self.gcode.respond_info("Error reading PN5180 tag: %s" % (e,))
                 self._set_scan_status("error", "Read failed", error=str(e))
-                self.handler.initialize(announce=False)
+                comm_lost = isinstance(e, PN5180CommunicationError)
+                if not comm_lost:
+                    comm_lost, detail = self._communication_lost()
+                if comm_lost:
+                    self.handler.initialize(announce=False)
+                else:
+                    self._recover_after_read_error()
                 self._debug_scan_line()
                 return None
         if last_error is not None:
