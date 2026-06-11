@@ -804,11 +804,11 @@ class PN5180Manager:
         self.reactor = printer.get_reactor()
         self.gcode = printer.lookup_object("gcode")
         self.handler = PN5180Handler(printer, spi, config)
-        self.tag_protocol = config.get("tag_protocol", "auto").lower()
-        if self.tag_protocol not in ("auto", "ntag", "iso15693"):
+        self.tag_format = config.get("tag_format", "ntag").lower()
+        if self.tag_format not in ("auto", "ntag", "openprinttag"):
             raise config.error(
-                "Option 'tag_protocol' in section '%s' must be auto, ntag, "
-                "or iso15693" % (config.get_name(),))
+                "Option 'tag_format' in section '%s' must be ntag, "
+                "openprinttag, or auto" % (config.get_name(),))
         self.debug_log = config.getboolean("debug_log", True)
         self.happyhare_enable = config.getboolean("happyhare_enable", True)
         self.iso15693_blocks_per_read = config.getint(
@@ -915,7 +915,7 @@ class PN5180Manager:
 
     def get_status(self):
         return {
-            "tag_protocol": self.tag_protocol,
+            "tag_format": self.tag_format,
             "debug_log": self.debug_log,
             "happyhare_enable": self.happyhare_enable,
             "iso15693_blocks_per_read": self.iso15693_blocks_per_read,
@@ -933,9 +933,9 @@ class PN5180Manager:
         }
 
     def _protocols_to_try(self):
-        if self.tag_protocol == "ntag":
+        if self.tag_format == "ntag":
             return ["ntag"]
-        if self.tag_protocol == "iso15693":
+        if self.tag_format == "openprinttag":
             return ["iso15693"]
         return ["ntag", "iso15693"]
 
@@ -945,9 +945,11 @@ class PN5180Manager:
         return "NTAG"
 
     def _scan_message(self):
-        if self.tag_protocol == "auto":
-            return "Scanning for NTAG/ISO15693"
-        return "Scanning for %s" % (self._protocol_label(self.tag_protocol),)
+        if self.tag_format == "auto":
+            return "Scanning for NTAG/OpenPrintTag"
+        if self.tag_format == "openprinttag":
+            return "Scanning for OpenPrintTag"
+        return "Scanning for NTAG"
 
     def _detect_tag(self):
         for protocol in self._protocols_to_try():
@@ -1362,8 +1364,8 @@ class PN5180:
         ret = self.service.start()
         if ret:
             self.gcode.respond_info(
-                "PN5180 read started. ISO15693 blocks_per_read=%d" % (
-                    self.manager.iso15693_blocks_per_read,))
+                "PN5180 read started. tag_format=%s" % (
+                    self.manager.tag_format,))
         else:
             self.gcode.respond_info("PN5180 read is already running.")
 
@@ -1393,7 +1395,7 @@ class PN5180:
         if self.manager is None:
             status.update({
                 "initialized": False,
-                "tag_protocol": "",
+                "tag_format": "",
                 "debug_log": False,
                 "happyhare_enable": False,
                 "scan_count": 0,
