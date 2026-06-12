@@ -1,4 +1,5 @@
-参考/
+/docs/
+/参考/
 __pycache__/
 *.py[cod]
 .pytest_cache/
