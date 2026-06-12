@@ -72,26 +72,6 @@ The installer also copies `config/pn5180.cfg` into the Klipper config directory 
 
 Restart Klipper after editing the configuration.
 
-## Minimal Configuration
-
-```ini
-[pn5180 mmu_reader]
-spi_bus: spi2_PB14_PB15_PB13
-cs_pin: mmu:PA8
-reset_pin: mmu:PC7
-
-spi_speed: 100000
-scan_period: 6.0
-read_on_start: False
-
-tag_format: ntag
-happyhare_enable: True
-debug_log: True
-```
-
-Use the SPI bus name provided by your Klipper MCU firmware. For STM32 builds,
-the available SPI bus names are shown in the Klipper build output or MCU enum
-definitions.
 
 ## Commands
 
