@@ -17,13 +17,17 @@ die() {
     exit 1
 }
 
-ensure_repo() {
-    git -C "${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-        || die "install.sh must be run from a cloned git repository."
+is_git_repo() {
+    git -C "${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1
 }
 
 update_repo() {
     local branch upstream local_rev remote_rev
+
+    if ! is_git_repo; then
+        info "This is not a git checkout; skipping update check."
+        return
+    fi
 
     if ! git -C "${REPO_DIR}" remote get-url origin >/dev/null 2>&1; then
         info "No origin remote configured; skipping update check."
@@ -86,10 +90,8 @@ install_plugin() {
         info "Replacing existing symlink: ${PLUGIN_DST} -> ${current_target}"
         rm -f "${PLUGIN_DST}"
     elif [ -e "${PLUGIN_DST}" ]; then
-        local backup
-        backup="${PLUGIN_DST}.bak.$(date +%Y%m%d%H%M%S)"
-        info "Existing pn5180.py found; backing it up to ${backup}"
-        mv "${PLUGIN_DST}" "${backup}"
+        info "Removing existing file: ${PLUGIN_DST}"
+        rm -f "${PLUGIN_DST}"
     fi
 
     ln -s "${PLUGIN_SRC}" "${PLUGIN_DST}"
@@ -99,7 +101,6 @@ install_plugin() {
 main() {
     info "Repository: ${REPO_DIR}"
     info "Klipper directory: ${KLIPPER_DIR}"
-    ensure_repo
     update_repo
     install_plugin
     info "Done. Restart Klipper after changing configuration."

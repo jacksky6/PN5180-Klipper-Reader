@@ -58,7 +58,9 @@ Run the installer:
 ./install.sh
 ```
 
-The installer checks GitHub for updates, fast-forwards the local repository when possible, and links `klippy/extras/pn5180.py` into `~/klipper/klippy/extras/`. If an old `pn5180.py` file already exists in Klipper, it is backed up before the symlink is created.
+The installer checks GitHub for updates when the project is a git checkout, fast-forwards the local repository when possible, and links `klippy/extras/pn5180.py` into `~/klipper/klippy/extras/`. If an old `pn5180.py` file already exists in Klipper, it is removed before the symlink is created.
+
+If you installed from a GitHub ZIP download instead of `git clone`, the installer still creates the symlink but skips the update check.
 
 If your Klipper checkout is not in `~/klipper`, pass it with `KLIPPER_DIR`:
 
