@@ -62,17 +62,13 @@ The installer checks GitHub for updates when the project is a git checkout, fast
 
 If you installed from a GitHub ZIP download instead of `git clone`, the installer still creates the symlink but skips the update check.
 
-If your Klipper checkout is not in `~/klipper`, pass it with `KLIPPER_DIR`:
+By default the installer uses `~/klipper` and `~/printer_data/config`. Override them with `-k` and `-c` when needed:
 
 ```bash
-KLIPPER_DIR=/path/to/klipper ./install.sh
+./install.sh -k /path/to/klipper -c /path/to/printer_data/config
 ```
 
-Then include or copy the example configuration from:
-
-```text
-config/pn5180.cfg
-```
+The installer also copies `config/pn5180.cfg` into the Klipper config directory when `pn5180.cfg` does not already exist. Existing config files are never overwritten. After the file is copied, add `[include pn5180.cfg]` to `printer.cfg` if it is not already included.
 
 Restart Klipper after editing the configuration.
 
