@@ -68,7 +68,7 @@ By default the installer uses `~/klipper` and `~/printer_data/config`. Override 
 ./install.sh -k /path/to/klipper -c /path/to/printer_data/config
 ```
 
-The installer also copies `config/pn5180.cfg` into the Klipper config directory when `pn5180.cfg` does not already exist. Existing config files are never overwritten. After the file is copied, add `[include pn5180.cfg]` to `printer.cfg` if it is not already included.
+The installer also copies `config/pn5180.cfg` into the Klipper config directory when `pn5180.cfg` does not already exist. Existing config files are never overwritten. Edit `pn5180.cfg` for your MCU, SPI bus, CS pin, reset pin, and tag format, then add `[include pn5180.cfg]` to `printer.cfg` if it is not already included.
 
 Restart Klipper after editing the configuration.
 

@@ -157,11 +157,14 @@ install_config() {
 
     if [ -e "${config_dst}" ]; then
         info "Config already exists; not overwriting: ${config_dst}"
+        info "Review pn5180.cfg for your MCU, SPI bus, CS pin, reset pin, and tag format."
         return
     fi
 
     cp "${CONFIG_SRC}" "${config_dst}"
     info "Installed config: ${config_dst}"
+    info "Edit pn5180.cfg for your MCU, SPI bus, CS pin, reset pin, and tag format."
+    info "Add [include pn5180.cfg] to your printer.cfg if it is not already included."
 }
 
 main() {
