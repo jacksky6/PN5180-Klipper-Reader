@@ -45,10 +45,25 @@ end side and `3.3V` powers the logic/SPI side. Check your module before wiring.
 
 ## Installation
 
-Copy the Klipper extra module into your Klipper installation:
+Clone the repository on your Klipper host:
 
 ```bash
-cp klippy/extras/pn5180.py ~/klipper/klippy/extras/pn5180.py
+git clone https://github.com/jacksky6/PN5180-Klipper-Reader.git
+cd PN5180-Klipper-Reader
+```
+
+Run the installer:
+
+```bash
+./install.sh
+```
+
+The installer checks GitHub for updates, fast-forwards the local repository when possible, and links `klippy/extras/pn5180.py` into `~/klipper/klippy/extras/`. If an old `pn5180.py` file already exists in Klipper, it is backed up before the symlink is created.
+
+If your Klipper checkout is not in `~/klipper`, pass it with `KLIPPER_DIR`:
+
+```bash
+KLIPPER_DIR=/path/to/klipper ./install.sh
 ```
 
 Then include or copy the example configuration from:
