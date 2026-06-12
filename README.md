@@ -1,6 +1,6 @@
-# PN5180 Klipper NFC Reader
+# PN5180 NFC Reader for Klipper
 
-PN5180 Klipper NFC Reader is a Klipper extra module for reading filament spool
+PN5180 NFC Reader for Klipper is a Klipper extra module for reading filament spool
 NFC tags through a PN5180 SPI reader. It is intended for shared-reader MMU
 setups where one reader is used to identify the loaded spool.
 
