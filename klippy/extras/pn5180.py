@@ -48,6 +48,7 @@ TX_RFON_IRQ_STAT = 1 << 9
 GENERAL_ERROR_IRQ_STAT = 1 << 17
 
 RX_BYTES_RECEIVED_MASK = 0x1FF
+MAX_READ_DATA_LEN = 255
 TRANSCEIVE_STATE_SHIFT = 24
 TRANSCEIVE_STATE_MASK = 0x07
 TRANSCEIVE_STATE_WAIT_TRANSMIT = 1
@@ -212,6 +213,10 @@ class PN5180Handler:
         self._transceive_command([CMD_SEND_DATA, valid_bits] + list(data))
 
     def read_data(self, length):
+        if length <= 0 or length > MAX_READ_DATA_LEN:
+            raise PN5180Error(
+                "invalid READ_DATA length %d; possible SPI/noise issue" % (
+                    length,))
         return self._transceive_command([CMD_READ_DATA, 0x00], length)
 
     def rx_bytes_received(self):
@@ -530,7 +535,8 @@ class PN5180Handler:
             logging.debug("PN5180 no ISO15693 inventory response")
             return None
         rx_len = self.rx_bytes_received()
-        if rx_len < 10 or rx_len == RX_BYTES_RECEIVED_MASK:
+        if (rx_len < 10 or rx_len == RX_BYTES_RECEIVED_MASK
+                or rx_len > MAX_READ_DATA_LEN):
             logging.debug("PN5180 invalid ISO15693 inventory length %d", rx_len)
             return None
         data = self.read_data(rx_len)
@@ -569,7 +575,8 @@ class PN5180Handler:
                               raise_on_error=False):
             raise PN5180Error("timeout waiting ISO15693 block %d" % (block,))
         rx_len = self.rx_bytes_received()
-        if rx_len in (0, RX_BYTES_RECEIVED_MASK):
+        if (rx_len in (0, RX_BYTES_RECEIVED_MASK)
+                or rx_len > MAX_READ_DATA_LEN):
             raise PN5180Error(
                 "invalid ISO15693 RX_STATUS length %d" % (rx_len,))
         data = self.read_data(rx_len)
@@ -601,7 +608,9 @@ class PN5180Handler:
                     start_block, start_block + block_count - 1))
         rx_len = self.rx_bytes_received()
         expected_len = 1 + block_count * 4
-        if rx_len in (0, RX_BYTES_RECEIVED_MASK):
+        if (rx_len in (0, RX_BYTES_RECEIVED_MASK)
+                or rx_len > MAX_READ_DATA_LEN
+                or rx_len != expected_len):
             raise PN5180Error(
                 "invalid ISO15693 RX_STATUS length %d" % (rx_len,))
         data = self.read_data(rx_len)
